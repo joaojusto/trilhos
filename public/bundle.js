@@ -149,6 +149,19 @@ var app = (function () {
     }
     const outroing = new Set();
     let outros;
+    function group_outros() {
+        outros = {
+            r: 0,
+            c: [],
+            p: outros // parent group
+        };
+    }
+    function check_outros() {
+        if (!outros.r) {
+            run_all(outros.c);
+        }
+        outros = outros.p;
+    }
     function transition_in(block, local) {
         if (block && block.i) {
             outroing.delete(block);
@@ -82103,10 +82116,14 @@ var app = (function () {
     	userStore.set(user);
     };
 
-    const isSignedIn = () => !!!user;
+    const subscribe = cb => userStore.subscribe(cb);
 
     const signIn = ({ email, password }) => {
     	firebase$1.auth().signInWithEmailAndPassword(email, password).then(onAuthStateChanged).catch(onError);
+    };
+
+    const signOut = () => {
+    	firebase$1.auth().signOut().then(onAuthStateChanged).catch(onError);
     };
 
     const signUp = ({ email, password }) => {
@@ -82130,7 +82147,7 @@ var app = (function () {
     	console.error(code, message);
     };
 
-    const subscribe = cb => {
+    const subscribe$1 = cb => {
     	if (tracksRef) return store.subscribe(cb);
     	tracksRef = firebase$1.database().ref(`tracks`);
     	store.subscribe(cb);
@@ -82583,11 +82600,11 @@ var app = (function () {
 
     function get_each_context(ctx, list, i) {
     	const child_ctx = ctx.slice();
-    	child_ctx[6] = list[i];
+    	child_ctx[7] = list[i];
     	return child_ctx;
     }
 
-    // (60:4) {:else}
+    // (68:4) {:else}
     function create_else_block_1(ctx) {
     	let auth;
     	let current;
@@ -82620,20 +82637,24 @@ var app = (function () {
     		block,
     		id: create_else_block_1.name,
     		type: "else",
-    		source: "(60:4) {:else}",
+    		source: "(68:4) {:else}",
     		ctx
     	});
 
     	return block;
     }
 
-    // (47:4) {#if isSignedIn()}
+    // (54:4) {#if isSignedIn}
     function create_if_block(ctx) {
     	let t0;
+    	let button;
+    	let t2;
     	let div;
-    	let t1;
+    	let t3;
     	let map;
     	let current;
+    	let mounted;
+    	let dispose;
 
     	function select_block_type_1(ctx, dirty) {
     		if (/*recording*/ ctx[1]) return create_if_block_1;
@@ -82659,28 +82680,39 @@ var app = (function () {
     		c: function create() {
     			if_block.c();
     			t0 = space();
+    			button = element("button");
+    			button.textContent = "Sign Out";
+    			t2 = space();
     			div = element("div");
 
     			for (let i = 0; i < each_blocks.length; i += 1) {
     				each_blocks[i].c();
     			}
 
-    			t1 = space();
+    			t3 = space();
     			create_component(map.$$.fragment);
-    			add_location(div, file$2, 53, 6, 1040);
+    			add_location(button, file$2, 59, 6, 1177);
+    			add_location(div, file$2, 61, 6, 1231);
     		},
     		m: function mount(target, anchor) {
     			if_block.m(target, anchor);
     			insert_dev(target, t0, anchor);
+    			insert_dev(target, button, anchor);
+    			insert_dev(target, t2, anchor);
     			insert_dev(target, div, anchor);
 
     			for (let i = 0; i < each_blocks.length; i += 1) {
     				each_blocks[i].m(div, null);
     			}
 
-    			insert_dev(target, t1, anchor);
+    			insert_dev(target, t3, anchor);
     			mount_component(map, target, anchor);
     			current = true;
+
+    			if (!mounted) {
+    				dispose = listen_dev(button, "click", signOut, false, false, false);
+    				mounted = true;
+    			}
     		},
     		p: function update(ctx, dirty) {
     			if (current_block_type === (current_block_type = select_block_type_1(ctx)) && if_block) {
@@ -82735,10 +82767,14 @@ var app = (function () {
     		d: function destroy(detaching) {
     			if_block.d(detaching);
     			if (detaching) detach_dev(t0);
+    			if (detaching) detach_dev(button);
+    			if (detaching) detach_dev(t2);
     			if (detaching) detach_dev(div);
     			destroy_each(each_blocks, detaching);
-    			if (detaching) detach_dev(t1);
+    			if (detaching) detach_dev(t3);
     			destroy_component(map, detaching);
+    			mounted = false;
+    			dispose();
     		}
     	};
 
@@ -82746,14 +82782,14 @@ var app = (function () {
     		block,
     		id: create_if_block.name,
     		type: "if",
-    		source: "(47:4) {#if isSignedIn()}",
+    		source: "(54:4) {#if isSignedIn}",
     		ctx
     	});
 
     	return block;
     }
 
-    // (50:6) {:else}
+    // (57:6) {:else}
     function create_else_block(ctx) {
     	let button;
     	let mounted;
@@ -82763,13 +82799,13 @@ var app = (function () {
     		c: function create() {
     			button = element("button");
     			button.textContent = "New";
-    			add_location(button, file$2, 50, 8, 981);
+    			add_location(button, file$2, 57, 8, 1119);
     		},
     		m: function mount(target, anchor) {
     			insert_dev(target, button, anchor);
 
     			if (!mounted) {
-    				dispose = listen_dev(button, "click", /*start*/ ctx[2], false, false, false);
+    				dispose = listen_dev(button, "click", /*start*/ ctx[3], false, false, false);
     				mounted = true;
     			}
     		},
@@ -82785,14 +82821,14 @@ var app = (function () {
     		block,
     		id: create_else_block.name,
     		type: "else",
-    		source: "(50:6) {:else}",
+    		source: "(57:6) {:else}",
     		ctx
     	});
 
     	return block;
     }
 
-    // (48:6) {#if recording}
+    // (55:6) {#if recording}
     function create_if_block_1(ctx) {
     	let button;
     	let mounted;
@@ -82802,13 +82838,13 @@ var app = (function () {
     		c: function create() {
     			button = element("button");
     			button.textContent = "Stop";
-    			add_location(button, file$2, 48, 8, 919);
+    			add_location(button, file$2, 55, 8, 1057);
     		},
     		m: function mount(target, anchor) {
     			insert_dev(target, button, anchor);
 
     			if (!mounted) {
-    				dispose = listen_dev(button, "click", /*stop*/ ctx[3], false, false, false);
+    				dispose = listen_dev(button, "click", /*stop*/ ctx[4], false, false, false);
     				mounted = true;
     			}
     		},
@@ -82824,31 +82860,31 @@ var app = (function () {
     		block,
     		id: create_if_block_1.name,
     		type: "if",
-    		source: "(48:6) {#if recording}",
+    		source: "(55:6) {#if recording}",
     		ctx
     	});
 
     	return block;
     }
 
-    // (55:8) {#each Object.keys(tracks) as trackId}
+    // (63:8) {#each Object.keys(tracks) as trackId}
     function create_each_block(ctx) {
     	let p;
-    	let t_value = /*trackId*/ ctx[6] + "";
+    	let t_value = /*trackId*/ ctx[7] + "";
     	let t;
 
     	const block = {
     		c: function create() {
     			p = element("p");
     			t = text(t_value);
-    			add_location(p, file$2, 55, 10, 1103);
+    			add_location(p, file$2, 63, 10, 1294);
     		},
     		m: function mount(target, anchor) {
     			insert_dev(target, p, anchor);
     			append_dev(p, t);
     		},
     		p: function update(ctx, dirty) {
-    			if (dirty & /*tracks*/ 1 && t_value !== (t_value = /*trackId*/ ctx[6] + "")) set_data_dev(t, t_value);
+    			if (dirty & /*tracks*/ 1 && t_value !== (t_value = /*trackId*/ ctx[7] + "")) set_data_dev(t, t_value);
     		},
     		d: function destroy(detaching) {
     			if (detaching) detach_dev(p);
@@ -82859,7 +82895,7 @@ var app = (function () {
     		block,
     		id: create_each_block.name,
     		type: "each",
-    		source: "(55:8) {#each Object.keys(tracks) as trackId}",
+    		source: "(63:8) {#each Object.keys(tracks) as trackId}",
     		ctx
     	});
 
@@ -82876,11 +82912,11 @@ var app = (function () {
     	const if_blocks = [];
 
     	function select_block_type(ctx, dirty) {
-    		if (isSignedIn()) return 0;
+    		if (/*isSignedIn*/ ctx[2]) return 0;
     		return 1;
     	}
 
-    	current_block_type_index = select_block_type();
+    	current_block_type_index = select_block_type(ctx);
     	if_block = if_blocks[current_block_type_index] = if_block_creators[current_block_type_index](ctx);
 
     	const block = {
@@ -82888,9 +82924,9 @@ var app = (function () {
     			main = element("main");
     			section = element("section");
     			if_block.c();
-    			add_location(section, file$2, 45, 2, 856);
+    			add_location(section, file$2, 52, 2, 996);
     			attr_dev(main, "class", "svelte-1osdl1z");
-    			add_location(main, file$2, 44, 0, 847);
+    			add_location(main, file$2, 51, 0, 987);
     		},
     		l: function claim(nodes) {
     			throw new Error("options.hydrate only works if the component was compiled with the `hydratable: true` option");
@@ -82902,7 +82938,31 @@ var app = (function () {
     			current = true;
     		},
     		p: function update(ctx, [dirty]) {
-    			if_block.p(ctx, dirty);
+    			let previous_block_index = current_block_type_index;
+    			current_block_type_index = select_block_type(ctx);
+
+    			if (current_block_type_index === previous_block_index) {
+    				if_blocks[current_block_type_index].p(ctx, dirty);
+    			} else {
+    				group_outros();
+
+    				transition_out(if_blocks[previous_block_index], 1, 1, () => {
+    					if_blocks[previous_block_index] = null;
+    				});
+
+    				check_outros();
+    				if_block = if_blocks[current_block_type_index];
+
+    				if (!if_block) {
+    					if_block = if_blocks[current_block_type_index] = if_block_creators[current_block_type_index](ctx);
+    					if_block.c();
+    				} else {
+    					if_block.p(ctx, dirty);
+    				}
+
+    				transition_in(if_block, 1);
+    				if_block.m(section, null);
+    			}
     		},
     		i: function intro(local) {
     			if (current) return;
@@ -82937,13 +82997,15 @@ var app = (function () {
     	let recording = false;
     	const store = writable(recording);
     	store.subscribe(value => $$invalidate(1, recording = value));
+    	let isSignedIn = false;
+    	subscribe(value => $$invalidate(2, isSignedIn = !!value));
     	const start = () => store.set(newTrack());
     	const stop = () => store.set(null);
     	const onTracks = value => $$invalidate(0, tracks = value);
 
     	onMount(() => {
     		initialize();
-    		subscribe(onTracks);
+    		subscribe$1(onTracks);
     	});
 
     	const writable_props = [];
@@ -82958,12 +83020,14 @@ var app = (function () {
     		Map: Map_1,
     		Auth,
     		initialize,
-    		isSignedIn,
-    		subscribe,
+    		onUserChange: subscribe,
+    		signOut,
+    		onTracksChange: subscribe$1,
     		newTrack,
     		tracks,
     		recording,
     		store,
+    		isSignedIn,
     		start,
     		stop,
     		onTracks
@@ -82972,13 +83036,14 @@ var app = (function () {
     	$$self.$inject_state = $$props => {
     		if ("tracks" in $$props) $$invalidate(0, tracks = $$props.tracks);
     		if ("recording" in $$props) $$invalidate(1, recording = $$props.recording);
+    		if ("isSignedIn" in $$props) $$invalidate(2, isSignedIn = $$props.isSignedIn);
     	};
 
     	if ($$props && "$$inject" in $$props) {
     		$$self.$inject_state($$props.$$inject);
     	}
 
-    	return [tracks, recording, start, stop];
+    	return [tracks, recording, isSignedIn, start, stop];
     }
 
     class App extends SvelteComponentDev {

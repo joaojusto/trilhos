@@ -22,13 +22,20 @@
 
   import Map from './components/Map.svelte';
   import Auth from './components/Auth.svelte';
-  import { initialize, isSignedIn } from './state/auth.svelte';
-  import { subscribe, newTrack } from './state/tracks.svelte';
+  import {
+    initialize,
+    subscribe as onUserChange,
+    signOut,
+  } from './state/auth.svelte';
+  import { subscribe as onTracksChange, newTrack } from './state/tracks.svelte';
 
   let tracks = {};
   let recording = false;
   const store = writable(recording);
   store.subscribe((value) => (recording = value));
+
+  let isSignedIn = false;
+  onUserChange((value) => (isSignedIn = !!value));
 
   const start = () => store.set(newTrack());
 
@@ -38,18 +45,19 @@
 
   onMount(() => {
     initialize();
-    subscribe(onTracks);
+    onTracksChange(onTracks);
   });
 </script>
 
 <main>
   <section>
-    {#if isSignedIn()}
+    {#if isSignedIn}
       {#if recording}
         <button on:click="{stop}">Stop</button>
       {:else}
         <button on:click="{start}">New</button>
       {/if}
+      <button on:click="{signOut}">Sign Out</button>
 
       <div>
         {#each Object.keys(tracks) as trackId}

@@ -30,7 +30,7 @@
     userStore.set(user);
   };
 
-  export const isSignedIn = () => !!!user;
+  export const subscribe = (cb) => userStore.subscribe(cb);
 
   export const signIn = ({ email, password }) => {
     firebase
