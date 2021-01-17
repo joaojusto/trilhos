@@ -25,12 +25,14 @@
   import { Map, View, Feature, Geolocation } from 'ol';
   import { Circle as CircleStyle, Fill, Stroke, Style } from 'ol/style';
   import Point from 'ol/geom/Point';
+  import Polygon from 'ol/geom/Polygon';
   import LineString from 'ol/geom/LineString';
   import { XYZ, OSM, Vector as VectorSource } from 'ol/source';
   import { Tile as TileLayer, Vector as VectorLayer } from 'ol/layer';
 
   import { savePosition } from '../state/tracks.svelte';
 
+  export let track;
   export let recording;
 
   let map = null;
@@ -41,23 +43,8 @@
 
   const positions = new LineString([], 'XYZM');
   const accuracyFeature = new Feature();
-  const positionFeature = new Feature();
-
-  const view = new View({ center: [0, 0], zoom: 18, tilePixelRatio: 2 });
-  const tileLayer = new TileLayer({ source: new OSM({ tilePixelRatio: 2 }) });
-  const outdoorsLayer = new TileLayer({
-    source: new XYZ({
-      url:
-        'https://tile.thunderforest.com/outdoors/{z}/{x}/{y}.png?apikey=f22952a25e0249e8995aac2c056e0f1d',
-      tilePixelRatio: 2,
-    }),
-  });
-  const vectorLayer = new VectorLayer({
-    source: new VectorSource({ features: [accuracyFeature, positionFeature] }),
-  });
-
-  positionFeature.setStyle(
-    new Style({
+  const positionFeature = new Feature({
+    style: {
       image: new CircleStyle({
         radius: 6,
         fill: new Fill({
@@ -68,8 +55,35 @@
           width: 2,
         }),
       }),
-    })
-  );
+    },
+  });
+  const trackFeature = new Feature({
+    name: 'track',
+    geometry: new Polygon([]),
+  });
+
+  const view = new View({ center: [0, 0], zoom: 18, tilePixelRatio: 2 });
+  const tileLayer = new TileLayer({ source: new OSM({ tilePixelRatio: 2 }) });
+  const outdoorsLayer = new TileLayer({
+    source: new XYZ({
+      url:
+        'https://tile.thunderforest.com/outdoors/{z}/{x}/{y}.png?apikey=f22952a25e0249e8995aac2c056e0f1d',
+      tilePixelRatio: 2,
+    }),
+  });
+
+  const vectorLayer = new VectorLayer({
+    source: new VectorSource({
+      features: [accuracyFeature, positionFeature, trackFeature],
+    }),
+  });
+
+  $: if (track) {
+    const points = Object.values(track, ([x, y]) => [x, y]);
+    const polygon = new Polygon([points]);
+    trackFeature.setGeometry(polygon);
+    view.fit(polygon, { padding: [170, 50, 30, 150] });
+  }
 
   const mod = (n) => ((n % (2 * Math.PI)) + 2 * Math.PI) % (2 * Math.PI);
 
@@ -140,12 +154,14 @@
     const coordinates = positions.getCoordinateAtM(m, true);
 
     if (!coordinates) return;
-    const [, , z] = coordinates;
-
-    view.setRotation(-z);
-    view.setCenter(getCenterWithHeading(coordinates, -z, resolution));
 
     positionFeature.setGeometry(new Point(coordinates));
+
+    if (!track) {
+      const [, , z] = coordinates;
+      view.setRotation(-z);
+      view.setCenter(getCenterWithHeading(coordinates, -z, resolution));
+    }
   };
 
   onMount(() => {

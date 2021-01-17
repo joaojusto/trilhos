@@ -9,6 +9,10 @@
     margin: 0 0;
   }
 
+  a {
+    cursor: pointer;
+  }
+
   @media (min-width: 640px) {
     main {
       max-width: none;
@@ -29,7 +33,6 @@
   } from './state/auth.svelte';
   import { subscribe as onTracksChange, newTrack } from './state/tracks.svelte';
 
-  let tracks = {};
   let recording = false;
   const store = writable(recording);
   store.subscribe((value) => (recording = value));
@@ -37,11 +40,22 @@
   let isSignedIn = false;
   onUserChange((value) => (isSignedIn = !!value));
 
-  const start = () => store.set(newTrack());
+  let tracks = {};
+  const onTracks = (value) => (tracks = value);
+
+  let selected = null;
+  const selectedStore = writable(selected);
+  selectedStore.subscribe((value) => (selected = value));
+
+  const start = () => {
+    const id = newTrack();
+    store.set(id);
+    selectedStore.set(null);
+  };
 
   const stop = () => store.set(null);
 
-  const onTracks = (value) => (tracks = value);
+  const showTrack = (trackId) => selectedStore.set(tracks[trackId]);
 
   onMount(() => {
     initialize();
@@ -61,10 +75,12 @@
 
       <div>
         {#each Object.keys(tracks) as trackId}
-          <p>{trackId}</p>
+          <ul>
+            <li><a on:click="{() => showTrack(trackId)}">{trackId}</a></li>
+          </ul>
         {/each}
       </div>
-      <Map recording="{recording}" />
+      <Map recording="{recording}" track="{selected}" />
     {:else}
       <Auth />
     {/if}
