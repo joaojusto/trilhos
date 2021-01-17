@@ -38,7 +38,7 @@ export default {
     sourcemap: true,
     format: 'iife',
     name: 'app',
-    file: 'public/build/bundle.js',
+    file: 'public/bundle.js',
   },
   plugins: [
     svelte({
@@ -78,17 +78,7 @@ export default {
     clearScreen: false,
   },
   moduleContext: (id) => {
-    // In order to match native module behaviour, Rollup sets `this`
-    // as `undefined` at the top level of modules. Rollup also outputs
-    // a warning if a module tries to access `this` at the top level.
-    // The following modules use `this` at the top level and expect it
-    // to be the global `window` object, so we tell Rollup to set
-    // `this = window` for these modules.
-    const thisAsWindowForModules = [
-      'node_modules/ol/',
-      // 'node_modules/ol',
-    ];
-
+    const thisAsWindowForModules = ['node_modules/ol/'];
     if (thisAsWindowForModules.some((id_) => id.includes(id_))) {
       return 'this';
     }
