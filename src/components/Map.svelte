@@ -25,7 +25,7 @@
   import { Map, View, Feature, Geolocation } from 'ol';
   import { Circle as CircleStyle, Fill, Stroke, Style } from 'ol/style';
   import Point from 'ol/geom/Point';
-  import Polygon from 'ol/geom/Polygon';
+  import MultiLineString from 'ol/geom/MultiLineString';
   import LineString from 'ol/geom/LineString';
   import { XYZ, OSM, Vector as VectorSource } from 'ol/source';
   import { Tile as TileLayer, Vector as VectorLayer } from 'ol/layer';
@@ -39,9 +39,10 @@
   let previousM = 0;
   let geolocation = null;
 
-  const deltaMean = 500; // the geolocation sampling period mean in ms
-
+  const deltaMean = 250; // the geolocation sampling period mean in ms
   const positions = new LineString([], 'XYZM');
+
+  const trackFeature = new Feature();
   const accuracyFeature = new Feature();
   const positionFeature = new Feature({
     style: {
@@ -56,10 +57,6 @@
         }),
       }),
     },
-  });
-  const trackFeature = new Feature({
-    name: 'track',
-    geometry: new Polygon([]),
   });
 
   const view = new View({ center: [0, 0], zoom: 18, tilePixelRatio: 2 });
@@ -80,9 +77,10 @@
 
   $: if (track) {
     const points = Object.values(track, ([x, y]) => [x, y]);
-    const polygon = new Polygon([points]);
+    const polygon = new MultiLineString([points]);
     trackFeature.setGeometry(polygon);
-    view.fit(polygon, { padding: [170, 50, 30, 150] });
+    trackFeature.setStyle(new Style({ stroke: new Stroke({ width: 4 }) }));
+    view.fit(polygon, { padding: [200, 200, 200, 200] });
   }
 
   const mod = (n) => ((n % (2 * Math.PI)) + 2 * Math.PI) % (2 * Math.PI);
