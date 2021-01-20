@@ -5,8 +5,10 @@
   }
 
   main {
+    height: 100%;
     padding: 0;
     margin: 0 0;
+    background: #f5fafe;
   }
 
   a {
@@ -26,6 +28,7 @@
 
   import Map from './components/Map.svelte';
   import Auth from './components/Auth.svelte';
+  import Layout from './components/Layout.svelte';
   import {
     initialize,
     subscribe as onUserChange,
@@ -64,14 +67,14 @@
 </script>
 
 <main>
-  <section>
+  <Layout>
     {#if isSignedIn}
-      {#if recording}
+      <!-- {#if recording}
         <button on:click="{stop}">Stop</button>
       {:else}
-        <button on:click="{start}">New</button>
-      {/if}
-      <button on:click="{signOut}">Sign Out</button>
+        <button>New</button>
+      {/if} -->
+      <!-- <button on:click="{signOut}">Sign Out</button> -->
 
       <div>
         {#each Object.keys(tracks) as trackId}
@@ -80,9 +83,9 @@
           </ul>
         {/each}
       </div>
-      <Map recording="{recording}" track="{selected}" />
+      <!-- <Map recording="{recording}" track="{selected}" /> -->
     {:else}
       <Auth />
     {/if}
-  </section>
+  </Layout>
 </main>

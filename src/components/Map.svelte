@@ -1,6 +1,6 @@
 <style>
   :global(.ol-viewport) {
-    min-height: 100vh;
+    flex: 1;
   }
 
   :global(.ol-overlaycontainer-stopevent) {
@@ -15,7 +15,9 @@
   }
 
   div {
-    min-height: 100vh;
+    display: flex;
+    flex-direction: column;
+    flex: 1;
   }
 </style>
 
@@ -80,7 +82,7 @@
     const polygon = new MultiLineString([points]);
     trackFeature.setGeometry(polygon);
     trackFeature.setStyle(new Style({ stroke: new Stroke({ width: 4 }) }));
-    view.fit(polygon, { padding: [200, 200, 200, 200] });
+    view.fit(polygon, { padding: [10, 10, 10, 10] });
   }
 
   const mod = (n) => ((n % (2 * Math.PI)) + 2 * Math.PI) % (2 * Math.PI);
