@@ -19,7 +19,17 @@
     tracksRef = firebase.database().ref(`tracks`);
 
     store.subscribe(cb);
-    tracksRef.on('value', (snapshot) => store.set(snapshot.val()));
+    tracksRef.on('value', (snapshot) => {
+      const rawData = snapshot.val();
+      const data = {};
+
+      Object.keys(rawData).map((id) => {
+        console.log(id, rawData[id]);
+        data[id] = { points: Object.values(rawData[id]), id };
+      });
+
+      store.set(data);
+    });
   };
 
   export const newTrack = () => {

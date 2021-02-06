@@ -11,10 +11,6 @@
     background: #f5fafe;
   }
 
-  a {
-    cursor: pointer;
-  }
-
   @media (min-width: 640px) {
     main {
       max-width: none;
@@ -27,6 +23,7 @@
   import { writable } from 'svelte/store';
 
   import Map from './components/Map.svelte';
+  import Feed from './components/Feed.svelte';
   import Auth from './components/Auth.svelte';
   import Layout from './components/Layout.svelte';
   import {
@@ -46,10 +43,6 @@
   let tracks = {};
   const onTracks = (value) => (tracks = value);
 
-  let selected = null;
-  const selectedStore = writable(selected);
-  selectedStore.subscribe((value) => (selected = value));
-
   const start = () => {
     const id = newTrack();
     store.set(id);
@@ -57,8 +50,6 @@
   };
 
   const stop = () => store.set(null);
-
-  const showTrack = (trackId) => selectedStore.set(tracks[trackId]);
 
   onMount(() => {
     initialize();
@@ -69,6 +60,7 @@
 <main>
   <Layout>
     {#if isSignedIn}
+      <Feed tracks="{tracks}" />
       <!-- {#if recording}
         <button on:click="{stop}">Stop</button>
       {:else}
@@ -76,13 +68,6 @@
       {/if} -->
       <!-- <button on:click="{signOut}">Sign Out</button> -->
 
-      <div>
-        {#each Object.keys(tracks) as trackId}
-          <ul>
-            <li><a on:click="{() => showTrack(trackId)}">{trackId}</a></li>
-          </ul>
-        {/each}
-      </div>
       <!-- <Map recording="{recording}" track="{selected}" /> -->
     {:else}
       <Auth />

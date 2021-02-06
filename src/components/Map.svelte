@@ -78,7 +78,8 @@
   });
 
   $: if (track) {
-    const points = Object.values(track, ([x, y]) => [x, y]);
+    console.log(track);
+    const points = track.points.map(([x, y]) => [x, y]);
     const polygon = new MultiLineString([points]);
     trackFeature.setGeometry(polygon);
     trackFeature.setStyle(new Style({ stroke: new Stroke({ width: 4 }) }));

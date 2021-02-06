@@ -4,6 +4,7 @@ var app = (function () {
     'use strict';
 
     function noop() { }
+    const identity = x => x;
     function assign(tar, src) {
         // @ts-ignore
         for (const k in src)
@@ -70,6 +71,41 @@ var app = (function () {
         }
     }
 
+    const is_client = typeof window !== 'undefined';
+    let now = is_client
+        ? () => window.performance.now()
+        : () => Date.now();
+    let raf = is_client ? cb => requestAnimationFrame(cb) : noop;
+
+    const tasks = new Set();
+    function run_tasks(now) {
+        tasks.forEach(task => {
+            if (!task.c(now)) {
+                tasks.delete(task);
+                task.f();
+            }
+        });
+        if (tasks.size !== 0)
+            raf(run_tasks);
+    }
+    /**
+     * Creates a new task that runs on each raf frame
+     * until it returns a falsy value or is aborted
+     */
+    function loop(callback) {
+        let task;
+        if (tasks.size === 0)
+            raf(run_tasks);
+        return {
+            promise: new Promise(fulfill => {
+                tasks.add(task = { c: callback, f: fulfill });
+            }),
+            abort() {
+                tasks.delete(task);
+            }
+        };
+    }
+
     function append(target, node) {
         target.appendChild(node);
     }
@@ -78,12 +114,6 @@ var app = (function () {
     }
     function detach(node) {
         node.parentNode.removeChild(node);
-    }
-    function destroy_each(iterations, detaching) {
-        for (let i = 0; i < iterations.length; i += 1) {
-            if (iterations[i])
-                iterations[i].d(detaching);
-        }
     }
     function element(name) {
         return document.createElement(name);
@@ -119,6 +149,136 @@ var app = (function () {
         return e;
     }
 
+    const active_docs = new Set();
+    let active = 0;
+    // https://github.com/darkskyapp/string-hash/blob/master/index.js
+    function hash(str) {
+        let hash = 5381;
+        let i = str.length;
+        while (i--)
+            hash = ((hash << 5) - hash) ^ str.charCodeAt(i);
+        return hash >>> 0;
+    }
+    function create_rule(node, a, b, duration, delay, ease, fn, uid = 0) {
+        const step = 16.666 / duration;
+        let keyframes = '{\n';
+        for (let p = 0; p <= 1; p += step) {
+            const t = a + (b - a) * ease(p);
+            keyframes += p * 100 + `%{${fn(t, 1 - t)}}\n`;
+        }
+        const rule = keyframes + `100% {${fn(b, 1 - b)}}\n}`;
+        const name = `__svelte_${hash(rule)}_${uid}`;
+        const doc = node.ownerDocument;
+        active_docs.add(doc);
+        const stylesheet = doc.__svelte_stylesheet || (doc.__svelte_stylesheet = doc.head.appendChild(element('style')).sheet);
+        const current_rules = doc.__svelte_rules || (doc.__svelte_rules = {});
+        if (!current_rules[name]) {
+            current_rules[name] = true;
+            stylesheet.insertRule(`@keyframes ${name} ${rule}`, stylesheet.cssRules.length);
+        }
+        const animation = node.style.animation || '';
+        node.style.animation = `${animation ? `${animation}, ` : ''}${name} ${duration}ms linear ${delay}ms 1 both`;
+        active += 1;
+        return name;
+    }
+    function delete_rule(node, name) {
+        const previous = (node.style.animation || '').split(', ');
+        const next = previous.filter(name
+            ? anim => anim.indexOf(name) < 0 // remove specific animation
+            : anim => anim.indexOf('__svelte') === -1 // remove all Svelte animations
+        );
+        const deleted = previous.length - next.length;
+        if (deleted) {
+            node.style.animation = next.join(', ');
+            active -= deleted;
+            if (!active)
+                clear_rules();
+        }
+    }
+    function clear_rules() {
+        raf(() => {
+            if (active)
+                return;
+            active_docs.forEach(doc => {
+                const stylesheet = doc.__svelte_stylesheet;
+                let i = stylesheet.cssRules.length;
+                while (i--)
+                    stylesheet.deleteRule(i);
+                doc.__svelte_rules = {};
+            });
+            active_docs.clear();
+        });
+    }
+
+    function create_animation(node, from, fn, params) {
+        if (!from)
+            return noop;
+        const to = node.getBoundingClientRect();
+        if (from.left === to.left && from.right === to.right && from.top === to.top && from.bottom === to.bottom)
+            return noop;
+        const { delay = 0, duration = 300, easing = identity, 
+        // @ts-ignore todo: should this be separated from destructuring? Or start/end added to public api and documentation?
+        start: start_time = now() + delay, 
+        // @ts-ignore todo:
+        end = start_time + duration, tick = noop, css } = fn(node, { from, to }, params);
+        let running = true;
+        let started = false;
+        let name;
+        function start() {
+            if (css) {
+                name = create_rule(node, 0, 1, duration, delay, easing, css);
+            }
+            if (!delay) {
+                started = true;
+            }
+        }
+        function stop() {
+            if (css)
+                delete_rule(node, name);
+            running = false;
+        }
+        loop(now => {
+            if (!started && now >= start_time) {
+                started = true;
+            }
+            if (started && now >= end) {
+                tick(1, 0);
+                stop();
+            }
+            if (!running) {
+                return false;
+            }
+            if (started) {
+                const p = now - start_time;
+                const t = 0 + 1 * easing(p / duration);
+                tick(t, 1 - t);
+            }
+            return true;
+        });
+        start();
+        tick(0, 1);
+        return stop;
+    }
+    function fix_position(node) {
+        const style = getComputedStyle(node);
+        if (style.position !== 'absolute' && style.position !== 'fixed') {
+            const { width, height } = style;
+            const a = node.getBoundingClientRect();
+            node.style.position = 'absolute';
+            node.style.width = width;
+            node.style.height = height;
+            add_transform(node, a);
+        }
+    }
+    function add_transform(node, a) {
+        const b = node.getBoundingClientRect();
+        if (a.left !== b.left || a.top !== b.top) {
+            const style = getComputedStyle(node);
+            const transform = style.transform === 'none' ? '' : style.transform;
+            node.style.transform = `${transform} translate(${a.left - b.left}px, ${a.top - b.top}px)`;
+        }
+    }
+
     let current_component;
     function set_current_component(component) {
         current_component = component;
@@ -130,6 +290,15 @@ var app = (function () {
     }
     function onMount(fn) {
         get_current_component().$$.on_mount.push(fn);
+    }
+    // TODO figure out if we still want to support
+    // shorthand events, or if we want to implement
+    // a real bubbling mechanism
+    function bubble(component, event) {
+        const callbacks = component.$$.callbacks[event.type];
+        if (callbacks) {
+            callbacks.slice().forEach(fn => fn(event));
+        }
     }
 
     const dirty_components = [];
@@ -195,6 +364,20 @@ var app = (function () {
             $$.after_update.forEach(add_render_callback);
         }
     }
+
+    let promise;
+    function wait() {
+        if (!promise) {
+            promise = Promise.resolve();
+            promise.then(() => {
+                promise = null;
+            });
+        }
+        return promise;
+    }
+    function dispatch(node, direction, kind) {
+        node.dispatchEvent(custom_event(`${direction ? 'intro' : 'outro'}${kind}`));
+    }
     const outroing = new Set();
     let outros;
     function group_outros() {
@@ -232,12 +415,225 @@ var app = (function () {
             block.o(local);
         }
     }
+    const null_transition = { duration: 0 };
+    function create_in_transition(node, fn, params) {
+        let config = fn(node, params);
+        let running = false;
+        let animation_name;
+        let task;
+        let uid = 0;
+        function cleanup() {
+            if (animation_name)
+                delete_rule(node, animation_name);
+        }
+        function go() {
+            const { delay = 0, duration = 300, easing = identity, tick = noop, css } = config || null_transition;
+            if (css)
+                animation_name = create_rule(node, 0, 1, duration, delay, easing, css, uid++);
+            tick(0, 1);
+            const start_time = now() + delay;
+            const end_time = start_time + duration;
+            if (task)
+                task.abort();
+            running = true;
+            add_render_callback(() => dispatch(node, true, 'start'));
+            task = loop(now => {
+                if (running) {
+                    if (now >= end_time) {
+                        tick(1, 0);
+                        dispatch(node, true, 'end');
+                        cleanup();
+                        return running = false;
+                    }
+                    if (now >= start_time) {
+                        const t = easing((now - start_time) / duration);
+                        tick(t, 1 - t);
+                    }
+                }
+                return running;
+            });
+        }
+        let started = false;
+        return {
+            start() {
+                if (started)
+                    return;
+                delete_rule(node);
+                if (is_function(config)) {
+                    config = config();
+                    wait().then(go);
+                }
+                else {
+                    go();
+                }
+            },
+            invalidate() {
+                started = false;
+            },
+            end() {
+                if (running) {
+                    cleanup();
+                    running = false;
+                }
+            }
+        };
+    }
+    function create_out_transition(node, fn, params) {
+        let config = fn(node, params);
+        let running = true;
+        let animation_name;
+        const group = outros;
+        group.r += 1;
+        function go() {
+            const { delay = 0, duration = 300, easing = identity, tick = noop, css } = config || null_transition;
+            if (css)
+                animation_name = create_rule(node, 1, 0, duration, delay, easing, css);
+            const start_time = now() + delay;
+            const end_time = start_time + duration;
+            add_render_callback(() => dispatch(node, false, 'start'));
+            loop(now => {
+                if (running) {
+                    if (now >= end_time) {
+                        tick(0, 1);
+                        dispatch(node, false, 'end');
+                        if (!--group.r) {
+                            // this will result in `end()` being called,
+                            // so we don't need to clean up here
+                            run_all(group.c);
+                        }
+                        return false;
+                    }
+                    if (now >= start_time) {
+                        const t = easing((now - start_time) / duration);
+                        tick(1 - t, t);
+                    }
+                }
+                return running;
+            });
+        }
+        if (is_function(config)) {
+            wait().then(() => {
+                // @ts-ignore
+                config = config();
+                go();
+            });
+        }
+        else {
+            go();
+        }
+        return {
+            end(reset) {
+                if (reset && config.tick) {
+                    config.tick(1, 0);
+                }
+                if (running) {
+                    if (animation_name)
+                        delete_rule(node, animation_name);
+                    running = false;
+                }
+            }
+        };
+    }
 
     const globals = (typeof window !== 'undefined'
         ? window
         : typeof globalThis !== 'undefined'
             ? globalThis
             : global);
+    function outro_and_destroy_block(block, lookup) {
+        transition_out(block, 1, 1, () => {
+            lookup.delete(block.key);
+        });
+    }
+    function fix_and_outro_and_destroy_block(block, lookup) {
+        block.f();
+        outro_and_destroy_block(block, lookup);
+    }
+    function update_keyed_each(old_blocks, dirty, get_key, dynamic, ctx, list, lookup, node, destroy, create_each_block, next, get_context) {
+        let o = old_blocks.length;
+        let n = list.length;
+        let i = o;
+        const old_indexes = {};
+        while (i--)
+            old_indexes[old_blocks[i].key] = i;
+        const new_blocks = [];
+        const new_lookup = new Map();
+        const deltas = new Map();
+        i = n;
+        while (i--) {
+            const child_ctx = get_context(ctx, list, i);
+            const key = get_key(child_ctx);
+            let block = lookup.get(key);
+            if (!block) {
+                block = create_each_block(key, child_ctx);
+                block.c();
+            }
+            else if (dynamic) {
+                block.p(child_ctx, dirty);
+            }
+            new_lookup.set(key, new_blocks[i] = block);
+            if (key in old_indexes)
+                deltas.set(key, Math.abs(i - old_indexes[key]));
+        }
+        const will_move = new Set();
+        const did_move = new Set();
+        function insert(block) {
+            transition_in(block, 1);
+            block.m(node, next);
+            lookup.set(block.key, block);
+            next = block.first;
+            n--;
+        }
+        while (o && n) {
+            const new_block = new_blocks[n - 1];
+            const old_block = old_blocks[o - 1];
+            const new_key = new_block.key;
+            const old_key = old_block.key;
+            if (new_block === old_block) {
+                // do nothing
+                next = new_block.first;
+                o--;
+                n--;
+            }
+            else if (!new_lookup.has(old_key)) {
+                // remove old block
+                destroy(old_block, lookup);
+                o--;
+            }
+            else if (!lookup.has(new_key) || will_move.has(new_key)) {
+                insert(new_block);
+            }
+            else if (did_move.has(old_key)) {
+                o--;
+            }
+            else if (deltas.get(new_key) > deltas.get(old_key)) {
+                did_move.add(new_key);
+                insert(new_block);
+            }
+            else {
+                will_move.add(old_key);
+                o--;
+            }
+        }
+        while (o--) {
+            const old_block = old_blocks[o];
+            if (!new_lookup.has(old_block.key))
+                destroy(old_block, lookup);
+        }
+        while (n)
+            insert(new_blocks[n - 1]);
+        return new_blocks;
+    }
+    function validate_each_keys(ctx, list, get_context, get_key) {
+        const keys = new Set();
+        for (let i = 0; i < list.length; i++) {
+            const key = get_key(get_context(ctx, list, i));
+            if (keys.has(key)) {
+                throw new Error('Cannot have duplicate keys in a keyed each');
+            }
+            keys.add(key);
+        }
+    }
     function create_component(block) {
         block && block.c();
     }
@@ -28383,7 +28779,7 @@ var app = (function () {
      * @param {TileCoord} tileCoord Tile coord.
      * @return {number} Hash.
      */
-    function hash(tileCoord) {
+    function hash$1(tileCoord) {
         return (tileCoord[1] << tileCoord[0]) + tileCoord[2];
     }
     /**
@@ -30589,7 +30985,7 @@ var app = (function () {
                 return undefined;
             }
             else {
-                var h = hash(tileCoord);
+                var h = hash$1(tileCoord);
                 var index = modulo(h, tileUrlFunctions.length);
                 return tileUrlFunctions[index](tileCoord, pixelRatio, projection);
             }
@@ -82542,7 +82938,18 @@ var app = (function () {
     	if (tracksRef) return store.subscribe(cb);
     	tracksRef = firebase$1.database().ref(`tracks`);
     	store.subscribe(cb);
-    	tracksRef.on("value", snapshot => store.set(snapshot.val()));
+
+    	tracksRef.on("value", snapshot => {
+    		const rawData = snapshot.val();
+    		const data = {};
+
+    		Object.keys(rawData).map(id => {
+    			console.log(id, rawData[id]);
+    			data[id] = { points: Object.values(rawData[id]), id };
+    		});
+
+    		store.set(data);
+    	});
     };
 
     const newTrack = () => {
@@ -82557,7 +82964,7 @@ var app = (function () {
 
     /* src/components/Map.svelte generated by Svelte v3.31.2 */
 
-    const { Object: Object_1, console: console_1 } = globals;
+    const { console: console_1 } = globals;
     const file = "src/components/Map.svelte";
 
     function create_fragment(ctx) {
@@ -82568,7 +82975,7 @@ var app = (function () {
     			div = element("div");
     			attr_dev(div, "id", "map");
     			attr_dev(div, "class", "map svelte-1y1l271");
-    			add_location(div, file, 185, 0, 5232);
+    			add_location(div, file, 186, 0, 5252);
     		},
     		l: function claim(nodes) {
     			throw new Error("options.hydrate only works if the component was compiled with the `hydratable: true` option");
@@ -82736,7 +83143,7 @@ var app = (function () {
 
     	const writable_props = ["track", "recording"];
 
-    	Object_1.keys($$props).forEach(key => {
+    	Object.keys($$props).forEach(key => {
     		if (!~writable_props.indexOf(key) && key.slice(0, 2) !== "$$") console_1.warn(`<Map> was created with unknown prop '${key}'`);
     	});
 
@@ -82802,7 +83209,8 @@ var app = (function () {
     	$$self.$$.update = () => {
     		if ($$self.$$.dirty & /*track*/ 1) {
     			 if (track) {
-    				const points = Object.values(track, ([x, y]) => [x, y]);
+    				console.log(track);
+    				const points = track.points.map(([x, y]) => [x, y]);
     				const polygon = new MultiLineString([points]);
     				trackFeature.setGeometry(polygon);
     				trackFeature.setStyle(new Style({ stroke: new Stroke({ width: 4 }) }));
@@ -82855,10 +83263,846 @@ var app = (function () {
     	}
     }
 
-    /* src/components/Auth.svelte generated by Svelte v3.31.2 */
-    const file$1 = "src/components/Auth.svelte";
+    function cubicOut(t) {
+        const f = t - 1.0;
+        return f * f * f + 1.0;
+    }
+    function quintOut(t) {
+        return --t * t * t * t * t + 1;
+    }
+
+    /*! *****************************************************************************
+    Copyright (c) Microsoft Corporation.
+
+    Permission to use, copy, modify, and/or distribute this software for any
+    purpose with or without fee is hereby granted.
+
+    THE SOFTWARE IS PROVIDED "AS IS" AND THE AUTHOR DISCLAIMS ALL WARRANTIES WITH
+    REGARD TO THIS SOFTWARE INCLUDING ALL IMPLIED WARRANTIES OF MERCHANTABILITY
+    AND FITNESS. IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR ANY SPECIAL, DIRECT,
+    INDIRECT, OR CONSEQUENTIAL DAMAGES OR ANY DAMAGES WHATSOEVER RESULTING FROM
+    LOSS OF USE, DATA OR PROFITS, WHETHER IN AN ACTION OF CONTRACT, NEGLIGENCE OR
+    OTHER TORTIOUS ACTION, ARISING OUT OF OR IN CONNECTION WITH THE USE OR
+    PERFORMANCE OF THIS SOFTWARE.
+    ***************************************************************************** */
+
+    function __rest(s, e) {
+        var t = {};
+        for (var p in s) if (Object.prototype.hasOwnProperty.call(s, p) && e.indexOf(p) < 0)
+            t[p] = s[p];
+        if (s != null && typeof Object.getOwnPropertySymbols === "function")
+            for (var i = 0, p = Object.getOwnPropertySymbols(s); i < p.length; i++) {
+                if (e.indexOf(p[i]) < 0 && Object.prototype.propertyIsEnumerable.call(s, p[i]))
+                    t[p[i]] = s[p[i]];
+            }
+        return t;
+    }
+    function crossfade(_a) {
+        var { fallback } = _a, defaults = __rest(_a, ["fallback"]);
+        const to_receive = new Map();
+        const to_send = new Map();
+        function crossfade(from, node, params) {
+            const { delay = 0, duration = d => Math.sqrt(d) * 30, easing = cubicOut } = assign(assign({}, defaults), params);
+            const to = node.getBoundingClientRect();
+            const dx = from.left - to.left;
+            const dy = from.top - to.top;
+            const dw = from.width / to.width;
+            const dh = from.height / to.height;
+            const d = Math.sqrt(dx * dx + dy * dy);
+            const style = getComputedStyle(node);
+            const transform = style.transform === 'none' ? '' : style.transform;
+            const opacity = +style.opacity;
+            return {
+                delay,
+                duration: is_function(duration) ? duration(d) : duration,
+                easing,
+                css: (t, u) => `
+				opacity: ${t * opacity};
+				transform-origin: top left;
+				transform: ${transform} translate(${u * dx}px,${u * dy}px) scale(${t + (1 - t) * dw}, ${t + (1 - t) * dh});
+			`
+            };
+        }
+        function transition(items, counterparts, intro) {
+            return (node, params) => {
+                items.set(params.key, {
+                    rect: node.getBoundingClientRect()
+                });
+                return () => {
+                    if (counterparts.has(params.key)) {
+                        const { rect } = counterparts.get(params.key);
+                        counterparts.delete(params.key);
+                        return crossfade(rect, node, params);
+                    }
+                    // if the node is disappearing altogether
+                    // (i.e. wasn't claimed by the other list)
+                    // then we need to supply an outro
+                    items.delete(params.key);
+                    return fallback && fallback(node, params, intro);
+                };
+            };
+        }
+        return [
+            transition(to_send, to_receive, false),
+            transition(to_receive, to_send, true)
+        ];
+    }
+
+    function flip(node, animation, params) {
+        const style = getComputedStyle(node);
+        const transform = style.transform === 'none' ? '' : style.transform;
+        const scaleX = animation.from.width / node.clientWidth;
+        const scaleY = animation.from.height / node.clientHeight;
+        const dx = (animation.from.left - animation.to.left) / scaleX;
+        const dy = (animation.from.top - animation.to.top) / scaleY;
+        const d = Math.sqrt(dx * dx + dy * dy);
+        const { delay = 0, duration = (d) => Math.sqrt(d) * 120, easing = cubicOut } = params;
+        return {
+            delay,
+            duration: is_function(duration) ? duration(d) : duration,
+            easing,
+            css: (_t, u) => `transform: ${transform} translate(${u * dx}px, ${u * dy}px);`
+        };
+    }
+
+    /* src/components/Activity.svelte generated by Svelte v3.31.2 */
+    const file$1 = "src/components/Activity.svelte";
 
     function create_fragment$1(ctx) {
+    	let button;
+    	let div;
+    	let t0;
+    	let t1;
+    	let mounted;
+    	let dispose;
+
+    	const block = {
+    		c: function create() {
+    			button = element("button");
+    			div = element("div");
+    			t0 = text(/*size*/ ctx[1]);
+    			t1 = text("m");
+    			attr_dev(div, "id", /*id*/ ctx[0]);
+    			attr_dev(div, "class", "map svelte-1q62iup");
+    			add_location(div, file$1, 66, 2, 1437);
+    			attr_dev(button, "class", "svelte-1q62iup");
+    			add_location(button, file$1, 65, 0, 1417);
+    		},
+    		l: function claim(nodes) {
+    			throw new Error("options.hydrate only works if the component was compiled with the `hydratable: true` option");
+    		},
+    		m: function mount(target, anchor) {
+    			insert_dev(target, button, anchor);
+    			append_dev(button, div);
+    			append_dev(div, t0);
+    			append_dev(div, t1);
+
+    			if (!mounted) {
+    				dispose = listen_dev(button, "click", /*click_handler*/ ctx[5], false, false, false);
+    				mounted = true;
+    			}
+    		},
+    		p: function update(ctx, [dirty]) {
+    			if (dirty & /*size*/ 2) set_data_dev(t0, /*size*/ ctx[1]);
+
+    			if (dirty & /*id*/ 1) {
+    				attr_dev(div, "id", /*id*/ ctx[0]);
+    			}
+    		},
+    		i: noop,
+    		o: noop,
+    		d: function destroy(detaching) {
+    			if (detaching) detach_dev(button);
+    			mounted = false;
+    			dispose();
+    		}
+    	};
+
+    	dispatch_dev("SvelteRegisterBlock", {
+    		block,
+    		id: create_fragment$1.name,
+    		type: "component",
+    		source: "",
+    		ctx
+    	});
+
+    	return block;
+    }
+
+    function instance$1($$self, $$props, $$invalidate) {
+    	let points;
+    	let geometry;
+    	let { $$slots: slots = {}, $$scope } = $$props;
+    	validate_slots("Activity", slots, []);
+    	let map;
+    	let size;
+    	let { id } = $$props;
+    	let { track } = $$props;
+
+    	const view = new View({
+    			center: [0, 0],
+    			zoom: 18,
+    			tilePixelRatio: 2
+    		});
+
+    	const trackFeature = new Feature();
+
+    	const vectorLayer = new VectorLayer({
+    			source: new VectorSource({ features: [trackFeature] })
+    		});
+
+    	onMount(() => {
+    		map = new Map$1({ view, layers: [vectorLayer], target: id });
+    		 $$invalidate(1, size = geometry.getLineStrings().reduce((size, line) => size + line.getLength(), 0));
+    	});
+
+    	const writable_props = ["id", "track"];
+
+    	Object.keys($$props).forEach(key => {
+    		if (!~writable_props.indexOf(key) && key.slice(0, 2) !== "$$") console.warn(`<Activity> was created with unknown prop '${key}'`);
+    	});
+
+    	function click_handler(event) {
+    		bubble($$self, event);
+    	}
+
+    	$$self.$$set = $$props => {
+    		if ("id" in $$props) $$invalidate(0, id = $$props.id);
+    		if ("track" in $$props) $$invalidate(2, track = $$props.track);
+    	};
+
+    	$$self.$capture_state = () => ({
+    		onMount,
+    		Map: Map$1,
+    		View,
+    		Feature,
+    		Stroke,
+    		Style,
+    		VectorLayer,
+    		VectorSource,
+    		MultiLineString,
+    		map,
+    		size,
+    		id,
+    		track,
+    		view,
+    		trackFeature,
+    		vectorLayer,
+    		points,
+    		geometry
+    	});
+
+    	$$self.$inject_state = $$props => {
+    		if ("map" in $$props) map = $$props.map;
+    		if ("size" in $$props) $$invalidate(1, size = $$props.size);
+    		if ("id" in $$props) $$invalidate(0, id = $$props.id);
+    		if ("track" in $$props) $$invalidate(2, track = $$props.track);
+    		if ("points" in $$props) $$invalidate(3, points = $$props.points);
+    		if ("geometry" in $$props) $$invalidate(4, geometry = $$props.geometry);
+    	};
+
+    	if ($$props && "$$inject" in $$props) {
+    		$$self.$inject_state($$props.$$inject);
+    	}
+
+    	$$self.$$.update = () => {
+    		if ($$self.$$.dirty & /*track*/ 4) {
+    			 $$invalidate(3, points = track.points.map(([x, y]) => [x, y]));
+    		}
+
+    		if ($$self.$$.dirty & /*points*/ 8) {
+    			 $$invalidate(4, geometry = new MultiLineString([points]));
+    		}
+
+    		if ($$self.$$.dirty & /*geometry*/ 16) {
+    			 trackFeature.setGeometry(geometry);
+    		}
+
+    		if ($$self.$$.dirty & /*geometry*/ 16) {
+    			 view.fit(geometry, { padding: [10, 10, 10, 10] });
+    		}
+    	};
+
+    	 trackFeature.setStyle(new Style({ stroke: new Stroke({ width: 4 }) }));
+    	return [id, size, track, points, geometry, click_handler];
+    }
+
+    class Activity extends SvelteComponentDev {
+    	constructor(options) {
+    		super(options);
+    		init(this, options, instance$1, create_fragment$1, safe_not_equal, { id: 0, track: 2 });
+
+    		dispatch_dev("SvelteRegisterComponent", {
+    			component: this,
+    			tagName: "Activity",
+    			options,
+    			id: create_fragment$1.name
+    		});
+
+    		const { ctx } = this.$$;
+    		const props = options.props || {};
+
+    		if (/*id*/ ctx[0] === undefined && !("id" in props)) {
+    			console.warn("<Activity> was created without expected prop 'id'");
+    		}
+
+    		if (/*track*/ ctx[2] === undefined && !("track" in props)) {
+    			console.warn("<Activity> was created without expected prop 'track'");
+    		}
+    	}
+
+    	get id() {
+    		throw new Error("<Activity>: Props cannot be read directly from the component instance unless compiling with 'accessors: true' or '<svelte:options accessors/>'");
+    	}
+
+    	set id(value) {
+    		throw new Error("<Activity>: Props cannot be set directly on the component instance unless compiling with 'accessors: true' or '<svelte:options accessors/>'");
+    	}
+
+    	get track() {
+    		throw new Error("<Activity>: Props cannot be read directly from the component instance unless compiling with 'accessors: true' or '<svelte:options accessors/>'");
+    	}
+
+    	set track(value) {
+    		throw new Error("<Activity>: Props cannot be set directly on the component instance unless compiling with 'accessors: true' or '<svelte:options accessors/>'");
+    	}
+    }
+
+    /* src/components/Track.svelte generated by Svelte v3.31.2 */
+
+    const file$2 = "src/components/Track.svelte";
+
+    function create_fragment$2(ctx) {
+    	let p;
+
+    	const block = {
+    		c: function create() {
+    			p = element("p");
+    			p.textContent = "Track";
+    			add_location(p, file$2, 0, 0, 0);
+    		},
+    		l: function claim(nodes) {
+    			throw new Error("options.hydrate only works if the component was compiled with the `hydratable: true` option");
+    		},
+    		m: function mount(target, anchor) {
+    			insert_dev(target, p, anchor);
+    		},
+    		p: noop,
+    		i: noop,
+    		o: noop,
+    		d: function destroy(detaching) {
+    			if (detaching) detach_dev(p);
+    		}
+    	};
+
+    	dispatch_dev("SvelteRegisterBlock", {
+    		block,
+    		id: create_fragment$2.name,
+    		type: "component",
+    		source: "",
+    		ctx
+    	});
+
+    	return block;
+    }
+
+    function instance$2($$self, $$props) {
+    	let { $$slots: slots = {}, $$scope } = $$props;
+    	validate_slots("Track", slots, []);
+    	const writable_props = [];
+
+    	Object.keys($$props).forEach(key => {
+    		if (!~writable_props.indexOf(key) && key.slice(0, 2) !== "$$") console.warn(`<Track> was created with unknown prop '${key}'`);
+    	});
+
+    	return [];
+    }
+
+    class Track extends SvelteComponentDev {
+    	constructor(options) {
+    		super(options);
+    		init(this, options, instance$2, create_fragment$2, safe_not_equal, {});
+
+    		dispatch_dev("SvelteRegisterComponent", {
+    			component: this,
+    			tagName: "Track",
+    			options,
+    			id: create_fragment$2.name
+    		});
+    	}
+    }
+
+    /* src/components/Feed.svelte generated by Svelte v3.31.2 */
+
+    const { Map: Map_1$1, Object: Object_1, console: console_1$1 } = globals;
+    const file$3 = "src/components/Feed.svelte";
+
+    function get_each_context(ctx, list, i) {
+    	const child_ctx = ctx.slice();
+    	child_ctx[8] = list[i];
+    	return child_ctx;
+    }
+
+    function get_each_context_1(ctx, list, i) {
+    	const child_ctx = ctx.slice();
+    	child_ctx[8] = list[i];
+    	return child_ctx;
+    }
+
+    // (76:2) {#each selectedTracks as id (id)}
+    function create_each_block_1(key_1, ctx) {
+    	let div;
+    	let t0_value = /*id*/ ctx[8] + "";
+    	let t0;
+    	let t1;
+    	let map;
+    	let t2;
+    	let div_intro;
+    	let div_outro;
+    	let rect;
+    	let stop_animation = noop;
+    	let current;
+
+    	map = new Map_1({
+    			props: {
+    				track: /*tracks*/ ctx[0][/*id*/ ctx[8]],
+    				recording: false
+    			},
+    			$$inline: true
+    		});
+
+    	const block = {
+    		key: key_1,
+    		first: null,
+    		c: function create() {
+    			div = element("div");
+    			t0 = text(t0_value);
+    			t1 = space();
+    			create_component(map.$$.fragment);
+    			t2 = space();
+    			attr_dev(div, "class", "svelte-18n5cps");
+    			add_location(div, file$3, 76, 4, 1635);
+    			this.first = div;
+    		},
+    		m: function mount(target, anchor) {
+    			insert_dev(target, div, anchor);
+    			append_dev(div, t0);
+    			append_dev(div, t1);
+    			mount_component(map, div, null);
+    			append_dev(div, t2);
+    			current = true;
+    		},
+    		p: function update(new_ctx, dirty) {
+    			ctx = new_ctx;
+    			if ((!current || dirty & /*selectedTracks*/ 4) && t0_value !== (t0_value = /*id*/ ctx[8] + "")) set_data_dev(t0, t0_value);
+    			const map_changes = {};
+    			if (dirty & /*tracks, selectedTracks*/ 5) map_changes.track = /*tracks*/ ctx[0][/*id*/ ctx[8]];
+    			map.$set(map_changes);
+    		},
+    		r: function measure() {
+    			rect = div.getBoundingClientRect();
+    		},
+    		f: function fix() {
+    			fix_position(div);
+    			stop_animation();
+    			add_transform(div, rect);
+    		},
+    		a: function animate() {
+    			stop_animation();
+    			stop_animation = create_animation(div, rect, flip, {});
+    		},
+    		i: function intro(local) {
+    			if (current) return;
+    			transition_in(map.$$.fragment, local);
+
+    			add_render_callback(() => {
+    				if (div_outro) div_outro.end(1);
+    				if (!div_intro) div_intro = create_in_transition(div, /*receive*/ ctx[4], { key: /*id*/ ctx[8] });
+    				div_intro.start();
+    			});
+
+    			current = true;
+    		},
+    		o: function outro(local) {
+    			transition_out(map.$$.fragment, local);
+    			if (div_intro) div_intro.invalidate();
+    			div_outro = create_out_transition(div, /*send*/ ctx[3], { key: /*id*/ ctx[8] });
+    			current = false;
+    		},
+    		d: function destroy(detaching) {
+    			if (detaching) detach_dev(div);
+    			destroy_component(map);
+    			if (detaching && div_outro) div_outro.end();
+    		}
+    	};
+
+    	dispatch_dev("SvelteRegisterBlock", {
+    		block,
+    		id: create_each_block_1.name,
+    		type: "each",
+    		source: "(76:2) {#each selectedTracks as id (id)}",
+    		ctx
+    	});
+
+    	return block;
+    }
+
+    // (85:2) {#each Object.keys(tracks).filter((trackId) => trackId !== (selected[0] && selected[0].id)) as id (id)}
+    function create_each_block(key_1, ctx) {
+    	let span;
+    	let activity;
+    	let t;
+    	let span_intro;
+    	let span_outro;
+    	let rect;
+    	let stop_animation = noop;
+    	let current;
+
+    	activity = new Activity({
+    			props: {
+    				track: /*tracks*/ ctx[0][/*id*/ ctx[8]],
+    				id: /*id*/ ctx[8]
+    			},
+    			$$inline: true
+    		});
+
+    	activity.$on("click", function () {
+    		if (is_function(/*showTrack*/ ctx[5](/*id*/ ctx[8]))) /*showTrack*/ ctx[5](/*id*/ ctx[8]).apply(this, arguments);
+    	});
+
+    	const block = {
+    		key: key_1,
+    		first: null,
+    		c: function create() {
+    			span = element("span");
+    			create_component(activity.$$.fragment);
+    			t = space();
+    			add_location(span, file$3, 85, 4, 1930);
+    			this.first = span;
+    		},
+    		m: function mount(target, anchor) {
+    			insert_dev(target, span, anchor);
+    			mount_component(activity, span, null);
+    			append_dev(span, t);
+    			current = true;
+    		},
+    		p: function update(new_ctx, dirty) {
+    			ctx = new_ctx;
+    			const activity_changes = {};
+    			if (dirty & /*tracks, selected*/ 3) activity_changes.track = /*tracks*/ ctx[0][/*id*/ ctx[8]];
+    			if (dirty & /*tracks, selected*/ 3) activity_changes.id = /*id*/ ctx[8];
+    			activity.$set(activity_changes);
+    		},
+    		r: function measure() {
+    			rect = span.getBoundingClientRect();
+    		},
+    		f: function fix() {
+    			fix_position(span);
+    			stop_animation();
+    			add_transform(span, rect);
+    		},
+    		a: function animate() {
+    			stop_animation();
+    			stop_animation = create_animation(span, rect, flip, {});
+    		},
+    		i: function intro(local) {
+    			if (current) return;
+    			transition_in(activity.$$.fragment, local);
+
+    			add_render_callback(() => {
+    				if (span_outro) span_outro.end(1);
+    				if (!span_intro) span_intro = create_in_transition(span, /*receive*/ ctx[4], { key: /*id*/ ctx[8] });
+    				span_intro.start();
+    			});
+
+    			current = true;
+    		},
+    		o: function outro(local) {
+    			transition_out(activity.$$.fragment, local);
+    			if (span_intro) span_intro.invalidate();
+    			span_outro = create_out_transition(span, /*send*/ ctx[3], { key: /*id*/ ctx[8] });
+    			current = false;
+    		},
+    		d: function destroy(detaching) {
+    			if (detaching) detach_dev(span);
+    			destroy_component(activity);
+    			if (detaching && span_outro) span_outro.end();
+    		}
+    	};
+
+    	dispatch_dev("SvelteRegisterBlock", {
+    		block,
+    		id: create_each_block.name,
+    		type: "each",
+    		source: "(85:2) {#each Object.keys(tracks).filter((trackId) => trackId !== (selected[0] && selected[0].id)) as id (id)}",
+    		ctx
+    	});
+
+    	return block;
+    }
+
+    function create_fragment$3(ctx) {
+    	let ul0;
+    	let t0;
+    	let each_blocks_1 = [];
+    	let each0_lookup = new Map_1$1();
+    	let t1;
+    	let ul1;
+    	let t2;
+    	let each_blocks = [];
+    	let each1_lookup = new Map_1$1();
+    	let current;
+    	let each_value_1 = /*selectedTracks*/ ctx[2];
+    	validate_each_argument(each_value_1);
+    	const get_key = ctx => /*id*/ ctx[8];
+    	validate_each_keys(ctx, each_value_1, get_each_context_1, get_key);
+
+    	for (let i = 0; i < each_value_1.length; i += 1) {
+    		let child_ctx = get_each_context_1(ctx, each_value_1, i);
+    		let key = get_key(child_ctx);
+    		each0_lookup.set(key, each_blocks_1[i] = create_each_block_1(key, child_ctx));
+    	}
+
+    	let each_value = Object.keys(/*tracks*/ ctx[0]).filter(/*func*/ ctx[6]);
+    	validate_each_argument(each_value);
+    	const get_key_1 = ctx => /*id*/ ctx[8];
+    	validate_each_keys(ctx, each_value, get_each_context, get_key_1);
+
+    	for (let i = 0; i < each_value.length; i += 1) {
+    		let child_ctx = get_each_context(ctx, each_value, i);
+    		let key = get_key_1(child_ctx);
+    		each1_lookup.set(key, each_blocks[i] = create_each_block(key, child_ctx));
+    	}
+
+    	const block = {
+    		c: function create() {
+    			ul0 = element("ul");
+    			t0 = text("selected:\n  ");
+
+    			for (let i = 0; i < each_blocks_1.length; i += 1) {
+    				each_blocks_1[i].c();
+    			}
+
+    			t1 = space();
+    			ul1 = element("ul");
+    			t2 = text("not selected:\n  ");
+
+    			for (let i = 0; i < each_blocks.length; i += 1) {
+    				each_blocks[i].c();
+    			}
+
+    			attr_dev(ul0, "class", "svelte-18n5cps");
+    			add_location(ul0, file$3, 73, 0, 1578);
+    			attr_dev(ul1, "class", "svelte-18n5cps");
+    			add_location(ul1, file$3, 82, 0, 1799);
+    		},
+    		l: function claim(nodes) {
+    			throw new Error("options.hydrate only works if the component was compiled with the `hydratable: true` option");
+    		},
+    		m: function mount(target, anchor) {
+    			insert_dev(target, ul0, anchor);
+    			append_dev(ul0, t0);
+
+    			for (let i = 0; i < each_blocks_1.length; i += 1) {
+    				each_blocks_1[i].m(ul0, null);
+    			}
+
+    			insert_dev(target, t1, anchor);
+    			insert_dev(target, ul1, anchor);
+    			append_dev(ul1, t2);
+
+    			for (let i = 0; i < each_blocks.length; i += 1) {
+    				each_blocks[i].m(ul1, null);
+    			}
+
+    			current = true;
+    		},
+    		p: function update(ctx, [dirty]) {
+    			if (dirty & /*selectedTracks, tracks*/ 5) {
+    				each_value_1 = /*selectedTracks*/ ctx[2];
+    				validate_each_argument(each_value_1);
+    				group_outros();
+    				for (let i = 0; i < each_blocks_1.length; i += 1) each_blocks_1[i].r();
+    				validate_each_keys(ctx, each_value_1, get_each_context_1, get_key);
+    				each_blocks_1 = update_keyed_each(each_blocks_1, dirty, get_key, 1, ctx, each_value_1, each0_lookup, ul0, fix_and_outro_and_destroy_block, create_each_block_1, null, get_each_context_1);
+    				for (let i = 0; i < each_blocks_1.length; i += 1) each_blocks_1[i].a();
+    				check_outros();
+    			}
+
+    			if (dirty & /*Object, tracks, selected, showTrack*/ 35) {
+    				each_value = Object.keys(/*tracks*/ ctx[0]).filter(/*func*/ ctx[6]);
+    				validate_each_argument(each_value);
+    				group_outros();
+    				for (let i = 0; i < each_blocks.length; i += 1) each_blocks[i].r();
+    				validate_each_keys(ctx, each_value, get_each_context, get_key_1);
+    				each_blocks = update_keyed_each(each_blocks, dirty, get_key_1, 1, ctx, each_value, each1_lookup, ul1, fix_and_outro_and_destroy_block, create_each_block, null, get_each_context);
+    				for (let i = 0; i < each_blocks.length; i += 1) each_blocks[i].a();
+    				check_outros();
+    			}
+    		},
+    		i: function intro(local) {
+    			if (current) return;
+
+    			for (let i = 0; i < each_value_1.length; i += 1) {
+    				transition_in(each_blocks_1[i]);
+    			}
+
+    			for (let i = 0; i < each_value.length; i += 1) {
+    				transition_in(each_blocks[i]);
+    			}
+
+    			current = true;
+    		},
+    		o: function outro(local) {
+    			for (let i = 0; i < each_blocks_1.length; i += 1) {
+    				transition_out(each_blocks_1[i]);
+    			}
+
+    			for (let i = 0; i < each_blocks.length; i += 1) {
+    				transition_out(each_blocks[i]);
+    			}
+
+    			current = false;
+    		},
+    		d: function destroy(detaching) {
+    			if (detaching) detach_dev(ul0);
+
+    			for (let i = 0; i < each_blocks_1.length; i += 1) {
+    				each_blocks_1[i].d();
+    			}
+
+    			if (detaching) detach_dev(t1);
+    			if (detaching) detach_dev(ul1);
+
+    			for (let i = 0; i < each_blocks.length; i += 1) {
+    				each_blocks[i].d();
+    			}
+    		}
+    	};
+
+    	dispatch_dev("SvelteRegisterBlock", {
+    		block,
+    		id: create_fragment$3.name,
+    		type: "component",
+    		source: "",
+    		ctx
+    	});
+
+    	return block;
+    }
+
+    function instance$3($$self, $$props, $$invalidate) {
+    	let selectedTracks;
+    	let { $$slots: slots = {}, $$scope } = $$props;
+    	validate_slots("Feed", slots, []);
+    	let { tracks } = $$props;
+
+    	const [send, receive] = crossfade({
+    		fallback(node, params) {
+    			const style = getComputedStyle(node);
+    			const transform = style.transform === "none" ? "" : style.transform;
+
+    			return {
+    				duration: 600,
+    				easing: quintOut,
+    				css: t => `
+					transform: ${transform} scale(${t});
+					opacity: ${t}
+				`
+    			};
+    		}
+    	});
+
+    	let selected = [];
+    	const selectedStore = writable(selected);
+    	selectedStore.subscribe(value => $$invalidate(1, selected = value));
+
+    	const showTrack = trackId => () => {
+    		console.log("show track", trackId);
+    		selectedStore.set([tracks[trackId]]);
+    	};
+
+    	const writable_props = ["tracks"];
+
+    	Object_1.keys($$props).forEach(key => {
+    		if (!~writable_props.indexOf(key) && key.slice(0, 2) !== "$$") console_1$1.warn(`<Feed> was created with unknown prop '${key}'`);
+    	});
+
+    	const func = trackId => trackId !== (selected[0] && selected[0].id);
+
+    	$$self.$$set = $$props => {
+    		if ("tracks" in $$props) $$invalidate(0, tracks = $$props.tracks);
+    	};
+
+    	$$self.$capture_state = () => ({
+    		quintOut,
+    		crossfade,
+    		flip,
+    		writable,
+    		Activity,
+    		Track,
+    		Map: Map_1,
+    		tracks,
+    		send,
+    		receive,
+    		selected,
+    		selectedStore,
+    		showTrack,
+    		selectedTracks
+    	});
+
+    	$$self.$inject_state = $$props => {
+    		if ("tracks" in $$props) $$invalidate(0, tracks = $$props.tracks);
+    		if ("selected" in $$props) $$invalidate(1, selected = $$props.selected);
+    		if ("selectedTracks" in $$props) $$invalidate(2, selectedTracks = $$props.selectedTracks);
+    	};
+
+    	if ($$props && "$$inject" in $$props) {
+    		$$self.$inject_state($$props.$$inject);
+    	}
+
+    	$$self.$$.update = () => {
+    		if ($$self.$$.dirty & /*tracks, selected*/ 3) {
+    			 $$invalidate(2, selectedTracks = Object.keys(tracks).filter(trackId => trackId === (selected[0] && selected[0].id)));
+    		}
+    	};
+
+    	return [tracks, selected, selectedTracks, send, receive, showTrack, func];
+    }
+
+    class Feed extends SvelteComponentDev {
+    	constructor(options) {
+    		super(options);
+    		init(this, options, instance$3, create_fragment$3, safe_not_equal, { tracks: 0 });
+
+    		dispatch_dev("SvelteRegisterComponent", {
+    			component: this,
+    			tagName: "Feed",
+    			options,
+    			id: create_fragment$3.name
+    		});
+
+    		const { ctx } = this.$$;
+    		const props = options.props || {};
+
+    		if (/*tracks*/ ctx[0] === undefined && !("tracks" in props)) {
+    			console_1$1.warn("<Feed> was created without expected prop 'tracks'");
+    		}
+    	}
+
+    	get tracks() {
+    		throw new Error("<Feed>: Props cannot be read directly from the component instance unless compiling with 'accessors: true' or '<svelte:options accessors/>'");
+    	}
+
+    	set tracks(value) {
+    		throw new Error("<Feed>: Props cannot be set directly on the component instance unless compiling with 'accessors: true' or '<svelte:options accessors/>'");
+    	}
+    }
+
+    /* src/components/Auth.svelte generated by Svelte v3.31.2 */
+    const file$4 = "src/components/Auth.svelte";
+
+    function create_fragment$4(ctx) {
     	let form;
     	let label0;
     	let t1;
@@ -82895,22 +84139,22 @@ var app = (function () {
     			button1 = element("button");
     			button1.textContent = "Sign Up";
     			attr_dev(label0, "for", "email");
-    			add_location(label0, file$1, 18, 2, 454);
+    			add_location(label0, file$4, 18, 2, 454);
     			attr_dev(input0, "type", "email");
     			attr_dev(input0, "name", "email");
     			attr_dev(input0, "placeholder", "Email");
-    			add_location(input0, file$1, 19, 2, 489);
+    			add_location(input0, file$4, 19, 2, 489);
     			attr_dev(label1, "for", "password");
-    			add_location(label1, file$1, 20, 2, 547);
+    			add_location(label1, file$4, 20, 2, 547);
     			attr_dev(input1, "type", "password");
     			attr_dev(input1, "name", "password");
-    			add_location(input1, file$1, 21, 2, 588);
+    			add_location(input1, file$4, 21, 2, 588);
     			attr_dev(button0, "type", "button");
-    			add_location(button0, file$1, 23, 4, 642);
+    			add_location(button0, file$4, 23, 4, 642);
     			attr_dev(button1, "type", "button");
-    			add_location(button1, file$1, 24, 4, 718);
-    			add_location(div, file$1, 22, 2, 632);
-    			add_location(form, file$1, 17, 0, 399);
+    			add_location(button1, file$4, 24, 4, 718);
+    			add_location(div, file$4, 22, 2, 632);
+    			add_location(form, file$4, 17, 0, 399);
     		},
     		l: function claim(nodes) {
     			throw new Error("options.hydrate only works if the component was compiled with the `hydratable: true` option");
@@ -82953,7 +84197,7 @@ var app = (function () {
 
     	dispatch_dev("SvelteRegisterBlock", {
     		block,
-    		id: create_fragment$1.name,
+    		id: create_fragment$4.name,
     		type: "component",
     		source: "",
     		ctx
@@ -82962,7 +84206,7 @@ var app = (function () {
     	return block;
     }
 
-    function instance$1($$self, $$props, $$invalidate) {
+    function instance$4($$self, $$props, $$invalidate) {
     	let { $$slots: slots = {}, $$scope } = $$props;
     	validate_slots("Auth", slots, []);
     	let state = {};
@@ -83008,22 +84252,22 @@ var app = (function () {
     class Auth extends SvelteComponentDev {
     	constructor(options) {
     		super(options);
-    		init(this, options, instance$1, create_fragment$1, safe_not_equal, {});
+    		init(this, options, instance$4, create_fragment$4, safe_not_equal, {});
 
     		dispatch_dev("SvelteRegisterComponent", {
     			component: this,
     			tagName: "Auth",
     			options,
-    			id: create_fragment$1.name
+    			id: create_fragment$4.name
     		});
     	}
     }
 
     /* src/components/Icon/tracks.svelte generated by Svelte v3.31.2 */
 
-    const file$2 = "src/components/Icon/tracks.svelte";
+    const file$5 = "src/components/Icon/tracks.svelte";
 
-    function create_fragment$2(ctx) {
+    function create_fragment$5(ctx) {
     	let svg;
     	let path;
 
@@ -83037,259 +84281,10 @@ var app = (function () {
     			attr_dev(path, "stroke-miterlimit", "10");
     			attr_dev(path, "stroke-linecap", "round");
     			attr_dev(path, "stroke-linejoin", "round");
-    			add_location(path, file$2, 6, 2, 108);
+    			add_location(path, file$5, 6, 2, 108);
     			attr_dev(svg, "width", "36");
     			attr_dev(svg, "height", "32");
     			attr_dev(svg, "viewBox", "0 0 36 32");
-    			attr_dev(svg, "fill", "none");
-    			attr_dev(svg, "xmlns", "http://www.w3.org/2000/svg");
-    			add_location(svg, file$2, 0, 0, 0);
-    		},
-    		l: function claim(nodes) {
-    			throw new Error("options.hydrate only works if the component was compiled with the `hydratable: true` option");
-    		},
-    		m: function mount(target, anchor) {
-    			insert_dev(target, svg, anchor);
-    			append_dev(svg, path);
-    		},
-    		p: noop,
-    		i: noop,
-    		o: noop,
-    		d: function destroy(detaching) {
-    			if (detaching) detach_dev(svg);
-    		}
-    	};
-
-    	dispatch_dev("SvelteRegisterBlock", {
-    		block,
-    		id: create_fragment$2.name,
-    		type: "component",
-    		source: "",
-    		ctx
-    	});
-
-    	return block;
-    }
-
-    function instance$2($$self, $$props) {
-    	let { $$slots: slots = {}, $$scope } = $$props;
-    	validate_slots("Tracks", slots, []);
-    	const writable_props = [];
-
-    	Object.keys($$props).forEach(key => {
-    		if (!~writable_props.indexOf(key) && key.slice(0, 2) !== "$$") console.warn(`<Tracks> was created with unknown prop '${key}'`);
-    	});
-
-    	return [];
-    }
-
-    class Tracks extends SvelteComponentDev {
-    	constructor(options) {
-    		super(options);
-    		init(this, options, instance$2, create_fragment$2, safe_not_equal, {});
-
-    		dispatch_dev("SvelteRegisterComponent", {
-    			component: this,
-    			tagName: "Tracks",
-    			options,
-    			id: create_fragment$2.name
-    		});
-    	}
-    }
-
-    /* src/components/Icon/start.svelte generated by Svelte v3.31.2 */
-
-    const file$3 = "src/components/Icon/start.svelte";
-
-    function create_fragment$3(ctx) {
-    	let svg;
-    	let path;
-
-    	const block = {
-    		c: function create() {
-    			svg = svg_element("svg");
-    			path = svg_element("path");
-    			attr_dev(path, "fill-rule", "evenodd");
-    			attr_dev(path, "clip-rule", "evenodd");
-    			attr_dev(path, "d", "M20 28C24.4183 28 28 24.4183 28 20C28 15.5817 24.4183 12 20 12C15.5817 12 12 15.5817 12 20C12 24.4183 15.5817 28 20 28ZM20 40C31.0457 40 40 31.0457 40 20C40 8.9543 31.0457 0 20 0C8.9543 0 0 8.9543 0 20C0 31.0457 8.9543 40 20 40ZM20 9C13.9249 9 9 13.9249 9 20C9 26.0751 13.9249 31 20 31C26.0751 31 31 26.0751 31 20C31 13.9249 26.0751 9 20 9ZM6 20C6 12.268 12.268 6 20 6C27.732 6 34 12.268 34 20C34 27.732 27.732 34 20 34C12.268 34 6 27.732 6 20Z");
-    			attr_dev(path, "fill", "#004FFF");
-    			add_location(path, file$3, 1, 2, 75);
-    			attr_dev(svg, "viewBox", "0 0 40 40");
-    			attr_dev(svg, "fill", "none");
-    			attr_dev(svg, "xmlns", "http://www.w3.org/2000/svg");
-    			add_location(svg, file$3, 0, 0, 0);
-    		},
-    		l: function claim(nodes) {
-    			throw new Error("options.hydrate only works if the component was compiled with the `hydratable: true` option");
-    		},
-    		m: function mount(target, anchor) {
-    			insert_dev(target, svg, anchor);
-    			append_dev(svg, path);
-    		},
-    		p: noop,
-    		i: noop,
-    		o: noop,
-    		d: function destroy(detaching) {
-    			if (detaching) detach_dev(svg);
-    		}
-    	};
-
-    	dispatch_dev("SvelteRegisterBlock", {
-    		block,
-    		id: create_fragment$3.name,
-    		type: "component",
-    		source: "",
-    		ctx
-    	});
-
-    	return block;
-    }
-
-    function instance$3($$self, $$props) {
-    	let { $$slots: slots = {}, $$scope } = $$props;
-    	validate_slots("Start", slots, []);
-    	const writable_props = [];
-
-    	Object.keys($$props).forEach(key => {
-    		if (!~writable_props.indexOf(key) && key.slice(0, 2) !== "$$") console.warn(`<Start> was created with unknown prop '${key}'`);
-    	});
-
-    	return [];
-    }
-
-    class Start extends SvelteComponentDev {
-    	constructor(options) {
-    		super(options);
-    		init(this, options, instance$3, create_fragment$3, safe_not_equal, {});
-
-    		dispatch_dev("SvelteRegisterComponent", {
-    			component: this,
-    			tagName: "Start",
-    			options,
-    			id: create_fragment$3.name
-    		});
-    	}
-    }
-
-    /* src/components/Icon/search.svelte generated by Svelte v3.31.2 */
-
-    const file$4 = "src/components/Icon/search.svelte";
-
-    function create_fragment$4(ctx) {
-    	let svg;
-    	let path0;
-    	let path1;
-
-    	const block = {
-    		c: function create() {
-    			svg = svg_element("svg");
-    			path0 = svg_element("path");
-    			path1 = svg_element("path");
-    			attr_dev(path0, "d", "M21 21L32 32");
-    			attr_dev(path0, "stroke", "#7A7265");
-    			attr_dev(path0, "stroke-width", "2");
-    			attr_dev(path0, "stroke-miterlimit", "10");
-    			attr_dev(path0, "stroke-linecap", "round");
-    			attr_dev(path0, "stroke-linejoin", "round");
-    			add_location(path0, file$4, 6, 2, 108);
-    			attr_dev(path1, "d", "M12.5 24C18.8513 24 24 18.8513 24 12.5C24 6.14873 18.8513 1 12.5 1C6.14873 1 1 6.14873 1 12.5C1 18.8513 6.14873 24 12.5 24Z");
-    			attr_dev(path1, "stroke", "#7A7265");
-    			attr_dev(path1, "stroke-width", "2");
-    			attr_dev(path1, "stroke-miterlimit", "10");
-    			attr_dev(path1, "stroke-linecap", "round");
-    			attr_dev(path1, "stroke-linejoin", "round");
-    			add_location(path1, file$4, 13, 2, 269);
-    			attr_dev(svg, "width", "33");
-    			attr_dev(svg, "height", "33");
-    			attr_dev(svg, "viewBox", "0 0 33 33");
-    			attr_dev(svg, "fill", "none");
-    			attr_dev(svg, "xmlns", "http://www.w3.org/2000/svg");
-    			add_location(svg, file$4, 0, 0, 0);
-    		},
-    		l: function claim(nodes) {
-    			throw new Error("options.hydrate only works if the component was compiled with the `hydratable: true` option");
-    		},
-    		m: function mount(target, anchor) {
-    			insert_dev(target, svg, anchor);
-    			append_dev(svg, path0);
-    			append_dev(svg, path1);
-    		},
-    		p: noop,
-    		i: noop,
-    		o: noop,
-    		d: function destroy(detaching) {
-    			if (detaching) detach_dev(svg);
-    		}
-    	};
-
-    	dispatch_dev("SvelteRegisterBlock", {
-    		block,
-    		id: create_fragment$4.name,
-    		type: "component",
-    		source: "",
-    		ctx
-    	});
-
-    	return block;
-    }
-
-    function instance$4($$self, $$props) {
-    	let { $$slots: slots = {}, $$scope } = $$props;
-    	validate_slots("Search", slots, []);
-    	const writable_props = [];
-
-    	Object.keys($$props).forEach(key => {
-    		if (!~writable_props.indexOf(key) && key.slice(0, 2) !== "$$") console.warn(`<Search> was created with unknown prop '${key}'`);
-    	});
-
-    	return [];
-    }
-
-    class Search extends SvelteComponentDev {
-    	constructor(options) {
-    		super(options);
-    		init(this, options, instance$4, create_fragment$4, safe_not_equal, {});
-
-    		dispatch_dev("SvelteRegisterComponent", {
-    			component: this,
-    			tagName: "Search",
-    			options,
-    			id: create_fragment$4.name
-    		});
-    	}
-    }
-
-    /* src/components/Icon/plus.svelte generated by Svelte v3.31.2 */
-
-    const file$5 = "src/components/Icon/plus.svelte";
-
-    function create_fragment$5(ctx) {
-    	let svg;
-    	let path0;
-    	let path1;
-
-    	const block = {
-    		c: function create() {
-    			svg = svg_element("svg");
-    			path0 = svg_element("path");
-    			path1 = svg_element("path");
-    			attr_dev(path0, "d", "M8.5 16.5C12.6421 16.5 16 13.1421 16 9C16 4.85786 12.6421 1.5 8.5 1.5C4.35786 1.5 1 4.85786 1 9C1 13.1421 4.35786 16.5 8.5 16.5Z");
-    			attr_dev(path0, "stroke", "#F5FAFE");
-    			attr_dev(path0, "stroke-width", "2");
-    			attr_dev(path0, "stroke-miterlimit", "10");
-    			attr_dev(path0, "stroke-linecap", "round");
-    			attr_dev(path0, "stroke-linejoin", "round");
-    			add_location(path0, file$5, 6, 2, 108);
-    			attr_dev(path1, "d", "M12.5 9H4.5M8.5 5V13V5Z");
-    			attr_dev(path1, "stroke", "#F5FAFE");
-    			attr_dev(path1, "stroke-width", "2");
-    			attr_dev(path1, "stroke-miterlimit", "10");
-    			attr_dev(path1, "stroke-linecap", "round");
-    			attr_dev(path1, "stroke-linejoin", "round");
-    			add_location(path1, file$5, 13, 2, 385);
-    			attr_dev(svg, "width", "17");
-    			attr_dev(svg, "height", "18");
-    			attr_dev(svg, "viewBox", "0 0 17 18");
     			attr_dev(svg, "fill", "none");
     			attr_dev(svg, "xmlns", "http://www.w3.org/2000/svg");
     			add_location(svg, file$5, 0, 0, 0);
@@ -83299,8 +84294,7 @@ var app = (function () {
     		},
     		m: function mount(target, anchor) {
     			insert_dev(target, svg, anchor);
-    			append_dev(svg, path0);
-    			append_dev(svg, path1);
+    			append_dev(svg, path);
     		},
     		p: noop,
     		i: noop,
@@ -83323,33 +84317,33 @@ var app = (function () {
 
     function instance$5($$self, $$props) {
     	let { $$slots: slots = {}, $$scope } = $$props;
-    	validate_slots("Plus", slots, []);
+    	validate_slots("Tracks", slots, []);
     	const writable_props = [];
 
     	Object.keys($$props).forEach(key => {
-    		if (!~writable_props.indexOf(key) && key.slice(0, 2) !== "$$") console.warn(`<Plus> was created with unknown prop '${key}'`);
+    		if (!~writable_props.indexOf(key) && key.slice(0, 2) !== "$$") console.warn(`<Tracks> was created with unknown prop '${key}'`);
     	});
 
     	return [];
     }
 
-    class Plus extends SvelteComponentDev {
+    class Tracks extends SvelteComponentDev {
     	constructor(options) {
     		super(options);
     		init(this, options, instance$5, create_fragment$5, safe_not_equal, {});
 
     		dispatch_dev("SvelteRegisterComponent", {
     			component: this,
-    			tagName: "Plus",
+    			tagName: "Tracks",
     			options,
     			id: create_fragment$5.name
     		});
     	}
     }
 
-    /* src/components/Icon/home.svelte generated by Svelte v3.31.2 */
+    /* src/components/Icon/start.svelte generated by Svelte v3.31.2 */
 
-    const file$6 = "src/components/Icon/home.svelte";
+    const file$6 = "src/components/Icon/start.svelte";
 
     function create_fragment$6(ctx) {
     	let svg;
@@ -83359,15 +84353,12 @@ var app = (function () {
     		c: function create() {
     			svg = svg_element("svg");
     			path = svg_element("path");
-    			attr_dev(path, "d", "M4 13V33H28V17V13L16 1L4 13Z");
-    			attr_dev(path, "stroke", "#0C090D");
-    			attr_dev(path, "stroke-width", "2");
-    			attr_dev(path, "stroke-linecap", "round");
-    			attr_dev(path, "stroke-linejoin", "round");
-    			add_location(path, file$6, 6, 2, 108);
-    			attr_dev(svg, "width", "32");
-    			attr_dev(svg, "height", "34");
-    			attr_dev(svg, "viewBox", "0 0 32 34");
+    			attr_dev(path, "fill-rule", "evenodd");
+    			attr_dev(path, "clip-rule", "evenodd");
+    			attr_dev(path, "d", "M20 28C24.4183 28 28 24.4183 28 20C28 15.5817 24.4183 12 20 12C15.5817 12 12 15.5817 12 20C12 24.4183 15.5817 28 20 28ZM20 40C31.0457 40 40 31.0457 40 20C40 8.9543 31.0457 0 20 0C8.9543 0 0 8.9543 0 20C0 31.0457 8.9543 40 20 40ZM20 9C13.9249 9 9 13.9249 9 20C9 26.0751 13.9249 31 20 31C26.0751 31 31 26.0751 31 20C31 13.9249 26.0751 9 20 9ZM6 20C6 12.268 12.268 6 20 6C27.732 6 34 12.268 34 20C34 27.732 27.732 34 20 34C12.268 34 6 27.732 6 20Z");
+    			attr_dev(path, "fill", "#004FFF");
+    			add_location(path, file$6, 1, 2, 75);
+    			attr_dev(svg, "viewBox", "0 0 40 40");
     			attr_dev(svg, "fill", "none");
     			attr_dev(svg, "xmlns", "http://www.w3.org/2000/svg");
     			add_location(svg, file$6, 0, 0, 0);
@@ -83400,46 +84391,61 @@ var app = (function () {
 
     function instance$6($$self, $$props) {
     	let { $$slots: slots = {}, $$scope } = $$props;
-    	validate_slots("Home", slots, []);
+    	validate_slots("Start", slots, []);
     	const writable_props = [];
 
     	Object.keys($$props).forEach(key => {
-    		if (!~writable_props.indexOf(key) && key.slice(0, 2) !== "$$") console.warn(`<Home> was created with unknown prop '${key}'`);
+    		if (!~writable_props.indexOf(key) && key.slice(0, 2) !== "$$") console.warn(`<Start> was created with unknown prop '${key}'`);
     	});
 
     	return [];
     }
 
-    class Home extends SvelteComponentDev {
+    class Start extends SvelteComponentDev {
     	constructor(options) {
     		super(options);
     		init(this, options, instance$6, create_fragment$6, safe_not_equal, {});
 
     		dispatch_dev("SvelteRegisterComponent", {
     			component: this,
-    			tagName: "Home",
+    			tagName: "Start",
     			options,
     			id: create_fragment$6.name
     		});
     	}
     }
 
-    /* src/components/Icon/bell.svelte generated by Svelte v3.31.2 */
+    /* src/components/Icon/search.svelte generated by Svelte v3.31.2 */
 
-    const file$7 = "src/components/Icon/bell.svelte";
+    const file$7 = "src/components/Icon/search.svelte";
 
     function create_fragment$7(ctx) {
     	let svg;
-    	let path;
+    	let path0;
+    	let path1;
 
     	const block = {
     		c: function create() {
     			svg = svg_element("svg");
-    			path = svg_element("path");
-    			attr_dev(path, "d", "M22.6667 11.6667L23.6523 11.8356C23.6619 11.7798 23.6667 11.7233 23.6667 11.6667H22.6667ZM5.33333 11.6667H4.33333C4.33333 11.7233 4.33814 11.7798 4.34771 11.8356L5.33333 11.6667ZM1 26.9048L0.229447 26.2674C-0.0174454 26.5659 -0.0697538 26.9801 0.0951861 27.3306C0.260126 27.6811 0.612642 27.9048 1 27.9048V26.9048ZM27 26.9048V27.9048C27.3874 27.9048 27.7399 27.6811 27.9048 27.3306C28.0698 26.9801 28.0174 26.5659 27.7706 26.2674L27 26.9048ZM22.6667 19.2857L21.7055 19.5618L22.6667 19.2857ZM5.33333 19.2857L6.29447 19.5618L5.33333 19.2857ZM19.7778 26.9048H20.7778V25.9048H19.7778V26.9048ZM8.22222 26.9048V25.9048H7.22222V26.9048H8.22222ZM6.33333 11.6667C6.33333 8.88262 7.06315 6.44527 8.36843 4.7297C9.65285 3.04154 11.5282 2 14 2V0C10.8876 0 8.4296 1.34628 6.77675 3.51869C5.14474 5.66369 4.33333 8.55967 4.33333 11.6667H6.33333ZM14 2C16.5468 2 18.4049 2.85682 19.651 4.39208C20.9235 5.95994 21.6667 8.36975 21.6667 11.6667H23.6667C23.6667 8.10645 22.8686 5.18291 21.2039 3.13173C19.5126 1.04794 17.0374 0 14 0V2ZM1 27.9048H27V25.9048H1V27.9048ZM27 26.9048C27.7706 26.2674 27.7706 26.2675 27.7707 26.2676C27.7707 26.2676 27.7708 26.2676 27.7708 26.2676C27.7708 26.2677 27.7708 26.2676 27.7707 26.2676C27.7705 26.2674 27.7702 26.2669 27.7696 26.2663C27.7686 26.265 27.7667 26.2627 27.7641 26.2595C27.7588 26.2531 27.7506 26.243 27.7395 26.2293C27.7173 26.2019 27.6836 26.1602 27.6399 26.1052C27.5525 25.9951 27.425 25.832 27.2681 25.6243C26.9539 25.2084 26.5235 24.6159 26.0618 23.9135C25.127 22.4913 24.1096 20.6869 23.6278 19.0096L21.7055 19.5618C22.2712 21.5312 23.4205 23.5363 24.3905 25.012C24.8811 25.7585 25.3377 26.3871 25.6723 26.8299C25.8398 27.0516 25.9772 27.2273 26.0736 27.3487C26.1218 27.4095 26.1598 27.4566 26.1862 27.4892C26.1994 27.5055 26.2097 27.5181 26.217 27.527C26.2206 27.5314 26.2235 27.5349 26.2256 27.5375C26.2266 27.5387 26.2275 27.5397 26.2281 27.5405C26.2284 27.5409 26.2287 27.5412 26.2289 27.5415C26.229 27.5416 26.2292 27.5418 26.2292 27.5419C26.2293 27.542 26.2294 27.5421 27 26.9048ZM23.6278 19.0096C23.2697 17.7629 23.2567 16.0058 23.3578 14.4742C23.4072 13.7257 23.4814 13.0619 23.5433 12.5856C23.5742 12.3478 23.6019 12.1576 23.6217 12.0282C23.6315 11.9635 23.6394 11.914 23.6447 11.8813C23.6474 11.865 23.6494 11.8529 23.6507 11.8452C23.6513 11.8414 23.6518 11.8386 23.6521 11.837C23.6522 11.8362 23.6523 11.8357 23.6523 11.8355C23.6523 11.8354 23.6523 11.8353 23.6523 11.8353C23.6523 11.8353 23.6523 11.8354 23.6523 11.8354C23.6523 11.8355 23.6523 11.8356 22.6667 11.6667C21.681 11.4977 21.681 11.4979 21.681 11.498C21.681 11.4981 21.6809 11.4983 21.6809 11.4984C21.6809 11.4988 21.6808 11.4991 21.6807 11.4996C21.6806 11.5005 21.6804 11.5017 21.6801 11.5032C21.6796 11.5063 21.6789 11.5104 21.678 11.5157C21.6763 11.5262 21.6738 11.5413 21.6706 11.5606C21.6643 11.5992 21.6555 11.655 21.6446 11.7263C21.6228 11.8689 21.593 12.0738 21.56 12.3279C21.4941 12.8352 21.4149 13.5422 21.3621 14.3425C21.2587 15.9086 21.2457 17.961 21.7055 19.5618L23.6278 19.0096ZM5.33333 11.6667C4.34771 11.8356 4.34769 11.8355 4.34768 11.8354C4.34767 11.8354 4.34766 11.8353 4.34766 11.8353C4.34766 11.8353 4.34766 11.8354 4.34768 11.8355C4.34772 11.8357 4.34781 11.8362 4.34795 11.837C4.34822 11.8386 4.34868 11.8414 4.34932 11.8452C4.35061 11.8529 4.35261 11.865 4.35526 11.8813C4.36057 11.914 4.36846 11.9635 4.37834 12.0282C4.3981 12.1576 4.4258 12.3478 4.45669 12.5856C4.51858 13.0619 4.59282 13.7257 4.64224 14.4742C4.74334 16.0058 4.73032 17.7629 4.3722 19.0096L6.29447 19.5618C6.7543 17.961 6.74128 15.9086 6.63789 14.3425C6.58506 13.5422 6.50594 12.8352 6.44002 12.3279C6.40702 12.0738 6.3772 11.8689 6.35543 11.7263C6.34454 11.655 6.33565 11.5992 6.32938 11.5606C6.32624 11.5413 6.32375 11.5262 6.32199 11.5157C6.32111 11.5104 6.32041 11.5063 6.3199 11.5032C6.31964 11.5017 6.31944 11.5005 6.31928 11.4996C6.3192 11.4991 6.31914 11.4988 6.31908 11.4984C6.31905 11.4983 6.31902 11.4981 6.31901 11.498C6.31898 11.4979 6.31896 11.4977 5.33333 11.6667ZM4.3722 19.0096C3.89042 20.6869 2.87302 22.4913 1.93822 23.9135C1.47647 24.6159 1.04614 25.2084 0.7319 25.6243C0.574959 25.832 0.447452 25.9951 0.360057 26.1052C0.316373 26.1602 0.282749 26.2019 0.260526 26.2293C0.249415 26.243 0.241158 26.2531 0.235921 26.2595C0.233303 26.2627 0.23144 26.265 0.230354 26.2663C0.229811 26.2669 0.229463 26.2674 0.22931 26.2676C0.229234 26.2676 0.229208 26.2677 0.22923 26.2676C0.229242 26.2676 0.229296 26.2676 0.229302 26.2676C0.229368 26.2675 0.229447 26.2674 1 26.9048C1.77055 27.5421 1.77066 27.542 1.77077 27.5419C1.77083 27.5418 1.77096 27.5416 1.77107 27.5415C1.77129 27.5412 1.77157 27.5409 1.77189 27.5405C1.77253 27.5397 1.77338 27.5387 1.77442 27.5375C1.7765 27.5349 1.77936 27.5314 1.78299 27.527C1.79026 27.5181 1.80058 27.5055 1.81379 27.4892C1.84021 27.4566 1.8782 27.4095 1.92641 27.3487C2.0228 27.2273 2.16019 27.0516 2.32766 26.8299C2.66225 26.3871 3.11885 25.7585 3.6095 25.012C4.57949 23.5363 5.72876 21.5312 6.29447 19.5618L4.3722 19.0096ZM18.7778 26.9048C18.7778 29.7699 16.589 32 14 32V34C17.793 34 20.7778 30.7723 20.7778 26.9048H18.7778ZM14 32C11.411 32 9.22222 29.7699 9.22222 26.9048H7.22222C7.22222 30.7723 10.207 34 14 34V32ZM8.22222 27.9048H19.7778V25.9048H8.22222V27.9048Z");
-    			attr_dev(path, "fill", "#0C090D");
-    			add_location(path, file$7, 1, 2, 75);
-    			attr_dev(svg, "viewBox", "0 0 28 34");
+    			path0 = svg_element("path");
+    			path1 = svg_element("path");
+    			attr_dev(path0, "d", "M21 21L32 32");
+    			attr_dev(path0, "stroke", "#7A7265");
+    			attr_dev(path0, "stroke-width", "2");
+    			attr_dev(path0, "stroke-miterlimit", "10");
+    			attr_dev(path0, "stroke-linecap", "round");
+    			attr_dev(path0, "stroke-linejoin", "round");
+    			add_location(path0, file$7, 6, 2, 108);
+    			attr_dev(path1, "d", "M12.5 24C18.8513 24 24 18.8513 24 12.5C24 6.14873 18.8513 1 12.5 1C6.14873 1 1 6.14873 1 12.5C1 18.8513 6.14873 24 12.5 24Z");
+    			attr_dev(path1, "stroke", "#7A7265");
+    			attr_dev(path1, "stroke-width", "2");
+    			attr_dev(path1, "stroke-miterlimit", "10");
+    			attr_dev(path1, "stroke-linecap", "round");
+    			attr_dev(path1, "stroke-linejoin", "round");
+    			add_location(path1, file$7, 13, 2, 269);
+    			attr_dev(svg, "width", "33");
+    			attr_dev(svg, "height", "33");
+    			attr_dev(svg, "viewBox", "0 0 33 33");
     			attr_dev(svg, "fill", "none");
     			attr_dev(svg, "xmlns", "http://www.w3.org/2000/svg");
     			add_location(svg, file$7, 0, 0, 0);
@@ -83449,7 +84455,8 @@ var app = (function () {
     		},
     		m: function mount(target, anchor) {
     			insert_dev(target, svg, anchor);
-    			append_dev(svg, path);
+    			append_dev(svg, path0);
+    			append_dev(svg, path1);
     		},
     		p: noop,
     		i: noop,
@@ -83472,66 +84479,61 @@ var app = (function () {
 
     function instance$7($$self, $$props) {
     	let { $$slots: slots = {}, $$scope } = $$props;
-    	validate_slots("Bell", slots, []);
+    	validate_slots("Search", slots, []);
     	const writable_props = [];
 
     	Object.keys($$props).forEach(key => {
-    		if (!~writable_props.indexOf(key) && key.slice(0, 2) !== "$$") console.warn(`<Bell> was created with unknown prop '${key}'`);
+    		if (!~writable_props.indexOf(key) && key.slice(0, 2) !== "$$") console.warn(`<Search> was created with unknown prop '${key}'`);
     	});
 
     	return [];
     }
 
-    class Bell extends SvelteComponentDev {
+    class Search extends SvelteComponentDev {
     	constructor(options) {
     		super(options);
     		init(this, options, instance$7, create_fragment$7, safe_not_equal, {});
 
     		dispatch_dev("SvelteRegisterComponent", {
     			component: this,
-    			tagName: "Bell",
+    			tagName: "Search",
     			options,
     			id: create_fragment$7.name
     		});
     	}
     }
 
-    /* src/components/Icon/arrowRight.svelte generated by Svelte v3.31.2 */
+    /* src/components/Icon/plus.svelte generated by Svelte v3.31.2 */
 
-    const file$8 = "src/components/Icon/arrowRight.svelte";
+    const file$8 = "src/components/Icon/plus.svelte";
 
     function create_fragment$8(ctx) {
     	let svg;
     	let path0;
     	let path1;
-    	let path2;
 
     	const block = {
     		c: function create() {
     			svg = svg_element("svg");
     			path0 = svg_element("path");
     			path1 = svg_element("path");
-    			path2 = svg_element("path");
-    			attr_dev(path0, "d", "M1.37168 17.887L1.47934 17.9088C3.41099 18.3006 4.67677 15.9482 3.2856 14.552V14.552C1.60204 12.8624 3.77253 10.1799 5.77626 11.4739L9.54579 13.9081C11.8237 15.3791 14.3587 12.4414 12.57 10.4034V10.4034C10.8947 8.49443 12.6247 5.55375 15.1071 6.09081L17.5851 6.6269");
-    			attr_dev(path0, "stroke", "#0C090D");
+    			attr_dev(path0, "d", "M8.5 16.5C12.6421 16.5 16 13.1421 16 9C16 4.85786 12.6421 1.5 8.5 1.5C4.35786 1.5 1 4.85786 1 9C1 13.1421 4.35786 16.5 8.5 16.5Z");
+    			attr_dev(path0, "stroke", "#F5FAFE");
     			attr_dev(path0, "stroke-width", "2");
     			attr_dev(path0, "stroke-miterlimit", "10");
     			attr_dev(path0, "stroke-linecap", "round");
     			attr_dev(path0, "stroke-linejoin", "round");
-    			add_location(path0, file$8, 6, 2, 110);
-    			attr_dev(path1, "d", "M33.884 6.88V8.368H30.924V18H29.1V8.368H26.124V6.88H33.884ZM37.5553 10.464C37.8219 10.016 38.1739 9.66933 38.6113 9.424C39.0593 9.168 39.5873 9.04 40.1953 9.04V10.928H39.7313C39.0166 10.928 38.4726 11.1093 38.0993 11.472C37.7366 11.8347 37.5553 12.464 37.5553 13.36V18H35.7313V9.184H37.5553V10.464ZM42.7999 8.016C42.4692 8.016 42.1919 7.904 41.9679 7.68C41.7439 7.456 41.6319 7.17867 41.6319 6.848C41.6319 6.51733 41.7439 6.24 41.9679 6.016C42.1919 5.792 42.4692 5.68 42.7999 5.68C43.1199 5.68 43.3919 5.792 43.6159 6.016C43.8399 6.24 43.9519 6.51733 43.9519 6.848C43.9519 7.17867 43.8399 7.456 43.6159 7.68C43.3919 7.904 43.1199 8.016 42.7999 8.016ZM43.6959 9.184V18H41.8719V9.184H43.6959ZM47.9146 6.16V18H46.0906V6.16H47.9146ZM54.8694 9.04C55.5414 9.04 56.1387 9.184 56.6614 9.472C57.1947 9.76 57.6107 10.1867 57.9094 10.752C58.2187 11.3173 58.3734 12 58.3734 12.8V18H56.5654V13.072C56.5654 12.2827 56.368 11.68 55.9734 11.264C55.5787 10.8373 55.04 10.624 54.3574 10.624C53.6747 10.624 53.1307 10.8373 52.7254 11.264C52.3307 11.68 52.1334 12.2827 52.1334 13.072V18H50.3094V6.16H52.1334V10.208C52.4427 9.83467 52.832 9.54667 53.3014 9.344C53.7814 9.14133 54.304 9.04 54.8694 9.04ZM64.524 18.144C63.692 18.144 62.94 17.9573 62.268 17.584C61.596 17.2 61.068 16.6667 60.684 15.984C60.3 15.2907 60.108 14.4907 60.108 13.584C60.108 12.688 60.3053 11.8933 60.7 11.2C61.0947 10.5067 61.6333 9.97333 62.316 9.6C62.9987 9.22667 63.7613 9.04 64.604 9.04C65.4467 9.04 66.2093 9.22667 66.892 9.6C67.5747 9.97333 68.1133 10.5067 68.508 11.2C68.9027 11.8933 69.1 12.688 69.1 13.584C69.1 14.48 68.8973 15.2747 68.492 15.968C68.0867 16.6613 67.532 17.2 66.828 17.584C66.1347 17.9573 65.3667 18.144 64.524 18.144ZM64.524 16.56C64.9933 16.56 65.4307 16.448 65.836 16.224C66.252 16 66.588 15.664 66.844 15.216C67.1 14.768 67.228 14.224 67.228 13.584C67.228 12.944 67.1053 12.4053 66.86 11.968C66.6147 11.52 66.2893 11.184 65.884 10.96C65.4787 10.736 65.0413 10.624 64.572 10.624C64.1027 10.624 63.6653 10.736 63.26 10.96C62.8653 11.184 62.5507 11.52 62.316 11.968C62.0813 12.4053 61.964 12.944 61.964 13.584C61.964 14.5333 62.204 15.2693 62.684 15.792C63.1747 16.304 63.788 16.56 64.524 16.56ZM74.4514 13.552C74.4514 12.6667 74.6327 11.8827 74.9954 11.2C75.3687 10.5173 75.87 9.98933 76.4994 9.616C77.1394 9.232 77.8487 9.04 78.6274 9.04C79.2034 9.04 79.7687 9.168 80.3234 9.424C80.8887 9.66933 81.3367 10 81.6674 10.416V6.16H83.5074V18H81.6674V16.672C81.3687 17.0987 80.9527 17.4507 80.4194 17.728C79.8967 18.0053 79.294 18.144 78.6114 18.144C77.8434 18.144 77.1394 17.952 76.4994 17.568C75.87 17.1733 75.3687 16.6293 74.9954 15.936C74.6327 15.232 74.4514 14.4373 74.4514 13.552ZM81.6674 13.584C81.6674 12.976 81.5394 12.448 81.2834 12C81.038 11.552 80.7127 11.2107 80.3074 10.976C79.902 10.7413 79.4647 10.624 78.9954 10.624C78.526 10.624 78.0887 10.7413 77.6834 10.976C77.278 11.2 76.9474 11.536 76.6914 11.984C76.446 12.4213 76.3234 12.944 76.3234 13.552C76.3234 14.16 76.446 14.6933 76.6914 15.152C76.9474 15.6107 77.278 15.9627 77.6834 16.208C78.0994 16.4427 78.5367 16.56 78.9954 16.56C79.4647 16.56 79.902 16.4427 80.3074 16.208C80.7127 15.9733 81.038 15.632 81.2834 15.184C81.5394 14.7253 81.6674 14.192 81.6674 13.584ZM89.7271 18.144C88.8951 18.144 88.1431 17.9573 87.4711 17.584C86.7991 17.2 86.2711 16.6667 85.8871 15.984C85.5031 15.2907 85.3111 14.4907 85.3111 13.584C85.3111 12.688 85.5085 11.8933 85.9031 11.2C86.2978 10.5067 86.8365 9.97333 87.5191 9.6C88.2018 9.22667 88.9645 9.04 89.8071 9.04C90.6498 9.04 91.4125 9.22667 92.0951 9.6C92.7778 9.97333 93.3165 10.5067 93.7111 11.2C94.1058 11.8933 94.3031 12.688 94.3031 13.584C94.3031 14.48 94.1005 15.2747 93.6951 15.968C93.2898 16.6613 92.7351 17.2 92.0311 17.584C91.3378 17.9573 90.5698 18.144 89.7271 18.144ZM89.7271 16.56C90.1965 16.56 90.6338 16.448 91.0391 16.224C91.4551 16 91.7911 15.664 92.0471 15.216C92.3031 14.768 92.4311 14.224 92.4311 13.584C92.4311 12.944 92.3085 12.4053 92.0631 11.968C91.8178 11.52 91.4925 11.184 91.0871 10.96C90.6818 10.736 90.2445 10.624 89.7751 10.624C89.3058 10.624 88.8685 10.736 88.4631 10.96C88.0685 11.184 87.7538 11.52 87.5191 11.968C87.2845 12.4053 87.1671 12.944 87.1671 13.584C87.1671 14.5333 87.4071 15.2693 87.8871 15.792C88.3778 16.304 88.9911 16.56 89.7271 16.56ZM103.927 18.112C103.18 18.112 102.508 17.984 101.911 17.728C101.313 17.4613 100.844 17.088 100.503 16.608C100.161 16.128 99.9905 15.568 99.9905 14.928H101.943C101.985 15.408 102.172 15.8027 102.503 16.112C102.844 16.4213 103.319 16.576 103.927 16.576C104.556 16.576 105.047 16.4267 105.399 16.128C105.751 15.8187 105.927 15.424 105.927 14.944C105.927 14.5707 105.815 14.2667 105.591 14.032C105.377 13.7973 105.105 13.616 104.775 13.488C104.455 13.36 104.007 13.2213 103.431 13.072C102.705 12.88 102.113 12.688 101.655 12.496C101.207 12.2933 100.823 11.984 100.503 11.568C100.183 11.152 100.023 10.5973 100.023 9.904C100.023 9.264 100.183 8.704 100.503 8.224C100.823 7.744 101.271 7.376 101.847 7.12C102.423 6.864 103.089 6.736 103.847 6.736C104.924 6.736 105.804 7.008 106.487 7.552C107.18 8.08533 107.564 8.82133 107.639 9.76H105.623C105.591 9.35467 105.399 9.008 105.047 8.72C104.695 8.432 104.231 8.288 103.655 8.288C103.132 8.288 102.705 8.42133 102.375 8.688C102.044 8.95467 101.879 9.33867 101.879 9.84C101.879 10.1813 101.98 10.464 102.183 10.688C102.396 10.9013 102.663 11.072 102.983 11.2C103.303 11.328 103.74 11.4667 104.295 11.616C105.031 11.8187 105.628 12.0213 106.087 12.224C106.556 12.4267 106.951 12.7413 107.271 13.168C107.601 13.584 107.767 14.144 107.767 14.848C107.767 15.4133 107.612 15.9467 107.303 16.448C107.004 16.9493 106.561 17.3547 105.975 17.664C105.399 17.9627 104.716 18.112 103.927 18.112ZM110.655 18.112C110.324 18.112 110.047 18 109.823 17.776C109.599 17.552 109.487 17.2747 109.487 16.944C109.487 16.6133 109.599 16.336 109.823 16.112C110.047 15.888 110.324 15.776 110.655 15.776C110.975 15.776 111.247 15.888 111.471 16.112C111.695 16.336 111.807 16.6133 111.807 16.944C111.807 17.2747 111.695 17.552 111.471 17.776C111.247 18 110.975 18.112 110.655 18.112ZM125.71 10.192C125.71 10.7573 125.577 11.2907 125.31 11.792C125.044 12.2933 124.617 12.704 124.03 13.024C123.444 13.3333 122.692 13.488 121.774 13.488H119.758V18H117.934V6.88H121.774C122.628 6.88 123.348 7.02933 123.934 7.328C124.532 7.616 124.974 8.01067 125.262 8.512C125.561 9.01333 125.71 9.57333 125.71 10.192ZM121.774 12C122.468 12 122.985 11.8453 123.326 11.536C123.668 11.216 123.838 10.768 123.838 10.192C123.838 8.976 123.15 8.368 121.774 8.368H119.758V12H121.774ZM135.53 13.376C135.53 13.7067 135.509 14.0053 135.466 14.272H128.73C128.783 14.976 129.045 15.5413 129.514 15.968C129.983 16.3947 130.559 16.608 131.242 16.608C132.223 16.608 132.917 16.1973 133.322 15.376H135.29C135.023 16.1867 134.538 16.8533 133.834 17.376C133.141 17.888 132.277 18.144 131.242 18.144C130.399 18.144 129.642 17.9573 128.97 17.584C128.309 17.2 127.786 16.6667 127.402 15.984C127.029 15.2907 126.842 14.4907 126.842 13.584C126.842 12.6773 127.023 11.8827 127.386 11.2C127.759 10.5067 128.277 9.97333 128.938 9.6C129.61 9.22667 130.378 9.04 131.242 9.04C132.074 9.04 132.815 9.22133 133.466 9.584C134.117 9.94667 134.623 10.4587 134.986 11.12C135.349 11.7707 135.53 12.5227 135.53 13.376ZM133.626 12.8C133.615 12.128 133.375 11.5893 132.906 11.184C132.437 10.7787 131.855 10.576 131.162 10.576C130.533 10.576 129.994 10.7787 129.546 11.184C129.098 11.5787 128.831 12.1173 128.746 12.8H133.626ZM136.717 13.552C136.717 12.6667 136.898 11.8827 137.261 11.2C137.634 10.5173 138.136 9.98933 138.765 9.616C139.405 9.232 140.114 9.04 140.893 9.04C141.469 9.04 142.034 9.168 142.589 9.424C143.154 9.66933 143.602 10 143.933 10.416V6.16H145.773V18H143.933V16.672C143.634 17.0987 143.218 17.4507 142.685 17.728C142.162 18.0053 141.56 18.144 140.877 18.144C140.109 18.144 139.405 17.952 138.765 17.568C138.136 17.1733 137.634 16.6293 137.261 15.936C136.898 15.232 136.717 14.4373 136.717 13.552ZM143.933 13.584C143.933 12.976 143.805 12.448 143.549 12C143.304 11.552 142.978 11.2107 142.573 10.976C142.168 10.7413 141.73 10.624 141.261 10.624C140.792 10.624 140.354 10.7413 139.949 10.976C139.544 11.2 139.213 11.536 138.957 11.984C138.712 12.4213 138.589 12.944 138.589 13.552C138.589 14.16 138.712 14.6933 138.957 15.152C139.213 15.6107 139.544 15.9627 139.949 16.208C140.365 16.4427 140.802 16.56 141.261 16.56C141.73 16.56 142.168 16.4427 142.573 16.208C142.978 15.9733 143.304 15.632 143.549 15.184C143.805 14.7253 143.933 14.192 143.933 13.584ZM149.993 10.464C150.259 10.016 150.611 9.66933 151.049 9.424C151.497 9.168 152.025 9.04 152.633 9.04V10.928H152.169C151.454 10.928 150.91 11.1093 150.537 11.472C150.174 11.8347 149.993 12.464 149.993 13.36V18H148.169V9.184H149.993V10.464ZM158.133 18.144C157.301 18.144 156.549 17.9573 155.877 17.584C155.205 17.2 154.677 16.6667 154.293 15.984C153.909 15.2907 153.717 14.4907 153.717 13.584C153.717 12.688 153.915 11.8933 154.309 11.2C154.704 10.5067 155.243 9.97333 155.925 9.6C156.608 9.22667 157.371 9.04 158.213 9.04C159.056 9.04 159.819 9.22667 160.501 9.6C161.184 9.97333 161.723 10.5067 162.117 11.2C162.512 11.8933 162.709 12.688 162.709 13.584C162.709 14.48 162.507 15.2747 162.101 15.968C161.696 16.6613 161.141 17.2 160.437 17.584C159.744 17.9573 158.976 18.144 158.133 18.144ZM158.133 16.56C158.603 16.56 159.04 16.448 159.445 16.224C159.861 16 160.197 15.664 160.453 15.216C160.709 14.768 160.837 14.224 160.837 13.584C160.837 12.944 160.715 12.4053 160.469 11.968C160.224 11.52 159.899 11.184 159.493 10.96C159.088 10.736 158.651 10.624 158.181 10.624C157.712 10.624 157.275 10.736 156.869 10.96C156.475 11.184 156.16 11.52 155.925 11.968C155.691 12.4053 155.573 12.944 155.573 13.584C155.573 14.5333 155.813 15.2693 156.293 15.792C156.784 16.304 157.397 16.56 158.133 16.56ZM177.805 18H175.981L170.493 9.696V18H168.669V6.864H170.493L175.981 15.152V6.864H177.805V18ZM184.024 18.144C183.192 18.144 182.44 17.9573 181.768 17.584C181.096 17.2 180.568 16.6667 180.184 15.984C179.8 15.2907 179.608 14.4907 179.608 13.584C179.608 12.688 179.805 11.8933 180.2 11.2C180.595 10.5067 181.133 9.97333 181.816 9.6C182.499 9.22667 183.261 9.04 184.104 9.04C184.947 9.04 185.709 9.22667 186.392 9.6C187.075 9.97333 187.613 10.5067 188.008 11.2C188.403 11.8933 188.6 12.688 188.6 13.584C188.6 14.48 188.397 15.2747 187.992 15.968C187.587 16.6613 187.032 17.2 186.328 17.584C185.635 17.9573 184.867 18.144 184.024 18.144ZM184.024 16.56C184.493 16.56 184.931 16.448 185.336 16.224C185.752 16 186.088 15.664 186.344 15.216C186.6 14.768 186.728 14.224 186.728 13.584C186.728 12.944 186.605 12.4053 186.36 11.968C186.115 11.52 185.789 11.184 185.384 10.96C184.979 10.736 184.541 10.624 184.072 10.624C183.603 10.624 183.165 10.736 182.76 10.96C182.365 11.184 182.051 11.52 181.816 11.968C181.581 12.4053 181.464 12.944 181.464 13.584C181.464 14.5333 181.704 15.2693 182.184 15.792C182.675 16.304 183.288 16.56 184.024 16.56ZM192.227 10.464C192.494 10.016 192.846 9.66933 193.283 9.424C193.731 9.168 194.259 9.04 194.867 9.04V10.928H194.403C193.688 10.928 193.144 11.1093 192.771 11.472C192.408 11.8347 192.227 12.464 192.227 13.36V18H190.403V9.184H192.227V10.464ZM198.672 10.672V15.552C198.672 15.8827 198.746 16.1227 198.896 16.272C199.056 16.4107 199.322 16.48 199.696 16.48H200.816V18H199.376C198.554 18 197.925 17.808 197.488 17.424C197.05 17.04 196.832 16.416 196.832 15.552V10.672H195.792V9.184H196.832V6.992H198.672V9.184H200.816V10.672H198.672ZM210.577 13.376C210.577 13.7067 210.556 14.0053 210.513 14.272H203.777C203.83 14.976 204.092 15.5413 204.561 15.968C205.03 16.3947 205.606 16.608 206.289 16.608C207.27 16.608 207.964 16.1973 208.369 15.376H210.337C210.07 16.1867 209.585 16.8533 208.881 17.376C208.188 17.888 207.324 18.144 206.289 18.144C205.446 18.144 204.689 17.9573 204.017 17.584C203.356 17.2 202.833 16.6667 202.449 15.984C202.076 15.2907 201.889 14.4907 201.889 13.584C201.889 12.6773 202.07 11.8827 202.433 11.2C202.806 10.5067 203.324 9.97333 203.985 9.6C204.657 9.22667 205.425 9.04 206.289 9.04C207.121 9.04 207.862 9.22133 208.513 9.584C209.164 9.94667 209.67 10.4587 210.033 11.12C210.396 11.7707 210.577 12.5227 210.577 13.376ZM208.673 12.8C208.662 12.128 208.422 11.5893 207.953 11.184C207.484 10.7787 206.902 10.576 206.209 10.576C205.58 10.576 205.041 10.7787 204.593 11.184C204.145 11.5787 203.878 12.1173 203.793 12.8H208.673Z");
-    			attr_dev(path1, "fill", "#004FFF");
-    			add_location(path1, file$8, 13, 2, 524);
-    			attr_dev(path2, "d", "M343.5 18L350.25 12.003L343.5 6");
-    			attr_dev(path2, "stroke", "#0C090D");
-    			attr_dev(path2, "stroke-width", "2");
-    			attr_dev(path2, "stroke-miterlimit", "10");
-    			attr_dev(path2, "stroke-linecap", "round");
-    			attr_dev(path2, "stroke-linejoin", "round");
-    			add_location(path2, file$8, 16, 2, 12912);
-    			attr_dev(svg, "width", "352");
-    			attr_dev(svg, "height", "24");
-    			attr_dev(svg, "viewBox", "0 0 352 24");
+    			add_location(path0, file$8, 6, 2, 108);
+    			attr_dev(path1, "d", "M12.5 9H4.5M8.5 5V13V5Z");
+    			attr_dev(path1, "stroke", "#F5FAFE");
+    			attr_dev(path1, "stroke-width", "2");
+    			attr_dev(path1, "stroke-miterlimit", "10");
+    			attr_dev(path1, "stroke-linecap", "round");
+    			attr_dev(path1, "stroke-linejoin", "round");
+    			add_location(path1, file$8, 13, 2, 385);
+    			attr_dev(svg, "width", "17");
+    			attr_dev(svg, "height", "18");
+    			attr_dev(svg, "viewBox", "0 0 17 18");
     			attr_dev(svg, "fill", "none");
     			attr_dev(svg, "xmlns", "http://www.w3.org/2000/svg");
     			add_location(svg, file$8, 0, 0, 0);
@@ -83543,7 +84545,6 @@ var app = (function () {
     			insert_dev(target, svg, anchor);
     			append_dev(svg, path0);
     			append_dev(svg, path1);
-    			append_dev(svg, path2);
     		},
     		p: noop,
     		i: noop,
@@ -83566,6 +84567,249 @@ var app = (function () {
 
     function instance$8($$self, $$props) {
     	let { $$slots: slots = {}, $$scope } = $$props;
+    	validate_slots("Plus", slots, []);
+    	const writable_props = [];
+
+    	Object.keys($$props).forEach(key => {
+    		if (!~writable_props.indexOf(key) && key.slice(0, 2) !== "$$") console.warn(`<Plus> was created with unknown prop '${key}'`);
+    	});
+
+    	return [];
+    }
+
+    class Plus extends SvelteComponentDev {
+    	constructor(options) {
+    		super(options);
+    		init(this, options, instance$8, create_fragment$8, safe_not_equal, {});
+
+    		dispatch_dev("SvelteRegisterComponent", {
+    			component: this,
+    			tagName: "Plus",
+    			options,
+    			id: create_fragment$8.name
+    		});
+    	}
+    }
+
+    /* src/components/Icon/home.svelte generated by Svelte v3.31.2 */
+
+    const file$9 = "src/components/Icon/home.svelte";
+
+    function create_fragment$9(ctx) {
+    	let svg;
+    	let path;
+
+    	const block = {
+    		c: function create() {
+    			svg = svg_element("svg");
+    			path = svg_element("path");
+    			attr_dev(path, "d", "M4 13V33H28V17V13L16 1L4 13Z");
+    			attr_dev(path, "stroke", "#0C090D");
+    			attr_dev(path, "stroke-width", "2");
+    			attr_dev(path, "stroke-linecap", "round");
+    			attr_dev(path, "stroke-linejoin", "round");
+    			add_location(path, file$9, 6, 2, 108);
+    			attr_dev(svg, "width", "32");
+    			attr_dev(svg, "height", "34");
+    			attr_dev(svg, "viewBox", "0 0 32 34");
+    			attr_dev(svg, "fill", "none");
+    			attr_dev(svg, "xmlns", "http://www.w3.org/2000/svg");
+    			add_location(svg, file$9, 0, 0, 0);
+    		},
+    		l: function claim(nodes) {
+    			throw new Error("options.hydrate only works if the component was compiled with the `hydratable: true` option");
+    		},
+    		m: function mount(target, anchor) {
+    			insert_dev(target, svg, anchor);
+    			append_dev(svg, path);
+    		},
+    		p: noop,
+    		i: noop,
+    		o: noop,
+    		d: function destroy(detaching) {
+    			if (detaching) detach_dev(svg);
+    		}
+    	};
+
+    	dispatch_dev("SvelteRegisterBlock", {
+    		block,
+    		id: create_fragment$9.name,
+    		type: "component",
+    		source: "",
+    		ctx
+    	});
+
+    	return block;
+    }
+
+    function instance$9($$self, $$props) {
+    	let { $$slots: slots = {}, $$scope } = $$props;
+    	validate_slots("Home", slots, []);
+    	const writable_props = [];
+
+    	Object.keys($$props).forEach(key => {
+    		if (!~writable_props.indexOf(key) && key.slice(0, 2) !== "$$") console.warn(`<Home> was created with unknown prop '${key}'`);
+    	});
+
+    	return [];
+    }
+
+    class Home extends SvelteComponentDev {
+    	constructor(options) {
+    		super(options);
+    		init(this, options, instance$9, create_fragment$9, safe_not_equal, {});
+
+    		dispatch_dev("SvelteRegisterComponent", {
+    			component: this,
+    			tagName: "Home",
+    			options,
+    			id: create_fragment$9.name
+    		});
+    	}
+    }
+
+    /* src/components/Icon/bell.svelte generated by Svelte v3.31.2 */
+
+    const file$a = "src/components/Icon/bell.svelte";
+
+    function create_fragment$a(ctx) {
+    	let svg;
+    	let path;
+
+    	const block = {
+    		c: function create() {
+    			svg = svg_element("svg");
+    			path = svg_element("path");
+    			attr_dev(path, "d", "M22.6667 11.6667L23.6523 11.8356C23.6619 11.7798 23.6667 11.7233 23.6667 11.6667H22.6667ZM5.33333 11.6667H4.33333C4.33333 11.7233 4.33814 11.7798 4.34771 11.8356L5.33333 11.6667ZM1 26.9048L0.229447 26.2674C-0.0174454 26.5659 -0.0697538 26.9801 0.0951861 27.3306C0.260126 27.6811 0.612642 27.9048 1 27.9048V26.9048ZM27 26.9048V27.9048C27.3874 27.9048 27.7399 27.6811 27.9048 27.3306C28.0698 26.9801 28.0174 26.5659 27.7706 26.2674L27 26.9048ZM22.6667 19.2857L21.7055 19.5618L22.6667 19.2857ZM5.33333 19.2857L6.29447 19.5618L5.33333 19.2857ZM19.7778 26.9048H20.7778V25.9048H19.7778V26.9048ZM8.22222 26.9048V25.9048H7.22222V26.9048H8.22222ZM6.33333 11.6667C6.33333 8.88262 7.06315 6.44527 8.36843 4.7297C9.65285 3.04154 11.5282 2 14 2V0C10.8876 0 8.4296 1.34628 6.77675 3.51869C5.14474 5.66369 4.33333 8.55967 4.33333 11.6667H6.33333ZM14 2C16.5468 2 18.4049 2.85682 19.651 4.39208C20.9235 5.95994 21.6667 8.36975 21.6667 11.6667H23.6667C23.6667 8.10645 22.8686 5.18291 21.2039 3.13173C19.5126 1.04794 17.0374 0 14 0V2ZM1 27.9048H27V25.9048H1V27.9048ZM27 26.9048C27.7706 26.2674 27.7706 26.2675 27.7707 26.2676C27.7707 26.2676 27.7708 26.2676 27.7708 26.2676C27.7708 26.2677 27.7708 26.2676 27.7707 26.2676C27.7705 26.2674 27.7702 26.2669 27.7696 26.2663C27.7686 26.265 27.7667 26.2627 27.7641 26.2595C27.7588 26.2531 27.7506 26.243 27.7395 26.2293C27.7173 26.2019 27.6836 26.1602 27.6399 26.1052C27.5525 25.9951 27.425 25.832 27.2681 25.6243C26.9539 25.2084 26.5235 24.6159 26.0618 23.9135C25.127 22.4913 24.1096 20.6869 23.6278 19.0096L21.7055 19.5618C22.2712 21.5312 23.4205 23.5363 24.3905 25.012C24.8811 25.7585 25.3377 26.3871 25.6723 26.8299C25.8398 27.0516 25.9772 27.2273 26.0736 27.3487C26.1218 27.4095 26.1598 27.4566 26.1862 27.4892C26.1994 27.5055 26.2097 27.5181 26.217 27.527C26.2206 27.5314 26.2235 27.5349 26.2256 27.5375C26.2266 27.5387 26.2275 27.5397 26.2281 27.5405C26.2284 27.5409 26.2287 27.5412 26.2289 27.5415C26.229 27.5416 26.2292 27.5418 26.2292 27.5419C26.2293 27.542 26.2294 27.5421 27 26.9048ZM23.6278 19.0096C23.2697 17.7629 23.2567 16.0058 23.3578 14.4742C23.4072 13.7257 23.4814 13.0619 23.5433 12.5856C23.5742 12.3478 23.6019 12.1576 23.6217 12.0282C23.6315 11.9635 23.6394 11.914 23.6447 11.8813C23.6474 11.865 23.6494 11.8529 23.6507 11.8452C23.6513 11.8414 23.6518 11.8386 23.6521 11.837C23.6522 11.8362 23.6523 11.8357 23.6523 11.8355C23.6523 11.8354 23.6523 11.8353 23.6523 11.8353C23.6523 11.8353 23.6523 11.8354 23.6523 11.8354C23.6523 11.8355 23.6523 11.8356 22.6667 11.6667C21.681 11.4977 21.681 11.4979 21.681 11.498C21.681 11.4981 21.6809 11.4983 21.6809 11.4984C21.6809 11.4988 21.6808 11.4991 21.6807 11.4996C21.6806 11.5005 21.6804 11.5017 21.6801 11.5032C21.6796 11.5063 21.6789 11.5104 21.678 11.5157C21.6763 11.5262 21.6738 11.5413 21.6706 11.5606C21.6643 11.5992 21.6555 11.655 21.6446 11.7263C21.6228 11.8689 21.593 12.0738 21.56 12.3279C21.4941 12.8352 21.4149 13.5422 21.3621 14.3425C21.2587 15.9086 21.2457 17.961 21.7055 19.5618L23.6278 19.0096ZM5.33333 11.6667C4.34771 11.8356 4.34769 11.8355 4.34768 11.8354C4.34767 11.8354 4.34766 11.8353 4.34766 11.8353C4.34766 11.8353 4.34766 11.8354 4.34768 11.8355C4.34772 11.8357 4.34781 11.8362 4.34795 11.837C4.34822 11.8386 4.34868 11.8414 4.34932 11.8452C4.35061 11.8529 4.35261 11.865 4.35526 11.8813C4.36057 11.914 4.36846 11.9635 4.37834 12.0282C4.3981 12.1576 4.4258 12.3478 4.45669 12.5856C4.51858 13.0619 4.59282 13.7257 4.64224 14.4742C4.74334 16.0058 4.73032 17.7629 4.3722 19.0096L6.29447 19.5618C6.7543 17.961 6.74128 15.9086 6.63789 14.3425C6.58506 13.5422 6.50594 12.8352 6.44002 12.3279C6.40702 12.0738 6.3772 11.8689 6.35543 11.7263C6.34454 11.655 6.33565 11.5992 6.32938 11.5606C6.32624 11.5413 6.32375 11.5262 6.32199 11.5157C6.32111 11.5104 6.32041 11.5063 6.3199 11.5032C6.31964 11.5017 6.31944 11.5005 6.31928 11.4996C6.3192 11.4991 6.31914 11.4988 6.31908 11.4984C6.31905 11.4983 6.31902 11.4981 6.31901 11.498C6.31898 11.4979 6.31896 11.4977 5.33333 11.6667ZM4.3722 19.0096C3.89042 20.6869 2.87302 22.4913 1.93822 23.9135C1.47647 24.6159 1.04614 25.2084 0.7319 25.6243C0.574959 25.832 0.447452 25.9951 0.360057 26.1052C0.316373 26.1602 0.282749 26.2019 0.260526 26.2293C0.249415 26.243 0.241158 26.2531 0.235921 26.2595C0.233303 26.2627 0.23144 26.265 0.230354 26.2663C0.229811 26.2669 0.229463 26.2674 0.22931 26.2676C0.229234 26.2676 0.229208 26.2677 0.22923 26.2676C0.229242 26.2676 0.229296 26.2676 0.229302 26.2676C0.229368 26.2675 0.229447 26.2674 1 26.9048C1.77055 27.5421 1.77066 27.542 1.77077 27.5419C1.77083 27.5418 1.77096 27.5416 1.77107 27.5415C1.77129 27.5412 1.77157 27.5409 1.77189 27.5405C1.77253 27.5397 1.77338 27.5387 1.77442 27.5375C1.7765 27.5349 1.77936 27.5314 1.78299 27.527C1.79026 27.5181 1.80058 27.5055 1.81379 27.4892C1.84021 27.4566 1.8782 27.4095 1.92641 27.3487C2.0228 27.2273 2.16019 27.0516 2.32766 26.8299C2.66225 26.3871 3.11885 25.7585 3.6095 25.012C4.57949 23.5363 5.72876 21.5312 6.29447 19.5618L4.3722 19.0096ZM18.7778 26.9048C18.7778 29.7699 16.589 32 14 32V34C17.793 34 20.7778 30.7723 20.7778 26.9048H18.7778ZM14 32C11.411 32 9.22222 29.7699 9.22222 26.9048H7.22222C7.22222 30.7723 10.207 34 14 34V32ZM8.22222 27.9048H19.7778V25.9048H8.22222V27.9048Z");
+    			attr_dev(path, "fill", "#0C090D");
+    			add_location(path, file$a, 1, 2, 75);
+    			attr_dev(svg, "viewBox", "0 0 28 34");
+    			attr_dev(svg, "fill", "none");
+    			attr_dev(svg, "xmlns", "http://www.w3.org/2000/svg");
+    			add_location(svg, file$a, 0, 0, 0);
+    		},
+    		l: function claim(nodes) {
+    			throw new Error("options.hydrate only works if the component was compiled with the `hydratable: true` option");
+    		},
+    		m: function mount(target, anchor) {
+    			insert_dev(target, svg, anchor);
+    			append_dev(svg, path);
+    		},
+    		p: noop,
+    		i: noop,
+    		o: noop,
+    		d: function destroy(detaching) {
+    			if (detaching) detach_dev(svg);
+    		}
+    	};
+
+    	dispatch_dev("SvelteRegisterBlock", {
+    		block,
+    		id: create_fragment$a.name,
+    		type: "component",
+    		source: "",
+    		ctx
+    	});
+
+    	return block;
+    }
+
+    function instance$a($$self, $$props) {
+    	let { $$slots: slots = {}, $$scope } = $$props;
+    	validate_slots("Bell", slots, []);
+    	const writable_props = [];
+
+    	Object.keys($$props).forEach(key => {
+    		if (!~writable_props.indexOf(key) && key.slice(0, 2) !== "$$") console.warn(`<Bell> was created with unknown prop '${key}'`);
+    	});
+
+    	return [];
+    }
+
+    class Bell extends SvelteComponentDev {
+    	constructor(options) {
+    		super(options);
+    		init(this, options, instance$a, create_fragment$a, safe_not_equal, {});
+
+    		dispatch_dev("SvelteRegisterComponent", {
+    			component: this,
+    			tagName: "Bell",
+    			options,
+    			id: create_fragment$a.name
+    		});
+    	}
+    }
+
+    /* src/components/Icon/arrowRight.svelte generated by Svelte v3.31.2 */
+
+    const file$b = "src/components/Icon/arrowRight.svelte";
+
+    function create_fragment$b(ctx) {
+    	let svg;
+    	let path0;
+    	let path1;
+    	let path2;
+
+    	const block = {
+    		c: function create() {
+    			svg = svg_element("svg");
+    			path0 = svg_element("path");
+    			path1 = svg_element("path");
+    			path2 = svg_element("path");
+    			attr_dev(path0, "d", "M1.37168 17.887L1.47934 17.9088C3.41099 18.3006 4.67677 15.9482 3.2856 14.552V14.552C1.60204 12.8624 3.77253 10.1799 5.77626 11.4739L9.54579 13.9081C11.8237 15.3791 14.3587 12.4414 12.57 10.4034V10.4034C10.8947 8.49443 12.6247 5.55375 15.1071 6.09081L17.5851 6.6269");
+    			attr_dev(path0, "stroke", "#0C090D");
+    			attr_dev(path0, "stroke-width", "2");
+    			attr_dev(path0, "stroke-miterlimit", "10");
+    			attr_dev(path0, "stroke-linecap", "round");
+    			attr_dev(path0, "stroke-linejoin", "round");
+    			add_location(path0, file$b, 6, 2, 110);
+    			attr_dev(path1, "d", "M33.884 6.88V8.368H30.924V18H29.1V8.368H26.124V6.88H33.884ZM37.5553 10.464C37.8219 10.016 38.1739 9.66933 38.6113 9.424C39.0593 9.168 39.5873 9.04 40.1953 9.04V10.928H39.7313C39.0166 10.928 38.4726 11.1093 38.0993 11.472C37.7366 11.8347 37.5553 12.464 37.5553 13.36V18H35.7313V9.184H37.5553V10.464ZM42.7999 8.016C42.4692 8.016 42.1919 7.904 41.9679 7.68C41.7439 7.456 41.6319 7.17867 41.6319 6.848C41.6319 6.51733 41.7439 6.24 41.9679 6.016C42.1919 5.792 42.4692 5.68 42.7999 5.68C43.1199 5.68 43.3919 5.792 43.6159 6.016C43.8399 6.24 43.9519 6.51733 43.9519 6.848C43.9519 7.17867 43.8399 7.456 43.6159 7.68C43.3919 7.904 43.1199 8.016 42.7999 8.016ZM43.6959 9.184V18H41.8719V9.184H43.6959ZM47.9146 6.16V18H46.0906V6.16H47.9146ZM54.8694 9.04C55.5414 9.04 56.1387 9.184 56.6614 9.472C57.1947 9.76 57.6107 10.1867 57.9094 10.752C58.2187 11.3173 58.3734 12 58.3734 12.8V18H56.5654V13.072C56.5654 12.2827 56.368 11.68 55.9734 11.264C55.5787 10.8373 55.04 10.624 54.3574 10.624C53.6747 10.624 53.1307 10.8373 52.7254 11.264C52.3307 11.68 52.1334 12.2827 52.1334 13.072V18H50.3094V6.16H52.1334V10.208C52.4427 9.83467 52.832 9.54667 53.3014 9.344C53.7814 9.14133 54.304 9.04 54.8694 9.04ZM64.524 18.144C63.692 18.144 62.94 17.9573 62.268 17.584C61.596 17.2 61.068 16.6667 60.684 15.984C60.3 15.2907 60.108 14.4907 60.108 13.584C60.108 12.688 60.3053 11.8933 60.7 11.2C61.0947 10.5067 61.6333 9.97333 62.316 9.6C62.9987 9.22667 63.7613 9.04 64.604 9.04C65.4467 9.04 66.2093 9.22667 66.892 9.6C67.5747 9.97333 68.1133 10.5067 68.508 11.2C68.9027 11.8933 69.1 12.688 69.1 13.584C69.1 14.48 68.8973 15.2747 68.492 15.968C68.0867 16.6613 67.532 17.2 66.828 17.584C66.1347 17.9573 65.3667 18.144 64.524 18.144ZM64.524 16.56C64.9933 16.56 65.4307 16.448 65.836 16.224C66.252 16 66.588 15.664 66.844 15.216C67.1 14.768 67.228 14.224 67.228 13.584C67.228 12.944 67.1053 12.4053 66.86 11.968C66.6147 11.52 66.2893 11.184 65.884 10.96C65.4787 10.736 65.0413 10.624 64.572 10.624C64.1027 10.624 63.6653 10.736 63.26 10.96C62.8653 11.184 62.5507 11.52 62.316 11.968C62.0813 12.4053 61.964 12.944 61.964 13.584C61.964 14.5333 62.204 15.2693 62.684 15.792C63.1747 16.304 63.788 16.56 64.524 16.56ZM74.4514 13.552C74.4514 12.6667 74.6327 11.8827 74.9954 11.2C75.3687 10.5173 75.87 9.98933 76.4994 9.616C77.1394 9.232 77.8487 9.04 78.6274 9.04C79.2034 9.04 79.7687 9.168 80.3234 9.424C80.8887 9.66933 81.3367 10 81.6674 10.416V6.16H83.5074V18H81.6674V16.672C81.3687 17.0987 80.9527 17.4507 80.4194 17.728C79.8967 18.0053 79.294 18.144 78.6114 18.144C77.8434 18.144 77.1394 17.952 76.4994 17.568C75.87 17.1733 75.3687 16.6293 74.9954 15.936C74.6327 15.232 74.4514 14.4373 74.4514 13.552ZM81.6674 13.584C81.6674 12.976 81.5394 12.448 81.2834 12C81.038 11.552 80.7127 11.2107 80.3074 10.976C79.902 10.7413 79.4647 10.624 78.9954 10.624C78.526 10.624 78.0887 10.7413 77.6834 10.976C77.278 11.2 76.9474 11.536 76.6914 11.984C76.446 12.4213 76.3234 12.944 76.3234 13.552C76.3234 14.16 76.446 14.6933 76.6914 15.152C76.9474 15.6107 77.278 15.9627 77.6834 16.208C78.0994 16.4427 78.5367 16.56 78.9954 16.56C79.4647 16.56 79.902 16.4427 80.3074 16.208C80.7127 15.9733 81.038 15.632 81.2834 15.184C81.5394 14.7253 81.6674 14.192 81.6674 13.584ZM89.7271 18.144C88.8951 18.144 88.1431 17.9573 87.4711 17.584C86.7991 17.2 86.2711 16.6667 85.8871 15.984C85.5031 15.2907 85.3111 14.4907 85.3111 13.584C85.3111 12.688 85.5085 11.8933 85.9031 11.2C86.2978 10.5067 86.8365 9.97333 87.5191 9.6C88.2018 9.22667 88.9645 9.04 89.8071 9.04C90.6498 9.04 91.4125 9.22667 92.0951 9.6C92.7778 9.97333 93.3165 10.5067 93.7111 11.2C94.1058 11.8933 94.3031 12.688 94.3031 13.584C94.3031 14.48 94.1005 15.2747 93.6951 15.968C93.2898 16.6613 92.7351 17.2 92.0311 17.584C91.3378 17.9573 90.5698 18.144 89.7271 18.144ZM89.7271 16.56C90.1965 16.56 90.6338 16.448 91.0391 16.224C91.4551 16 91.7911 15.664 92.0471 15.216C92.3031 14.768 92.4311 14.224 92.4311 13.584C92.4311 12.944 92.3085 12.4053 92.0631 11.968C91.8178 11.52 91.4925 11.184 91.0871 10.96C90.6818 10.736 90.2445 10.624 89.7751 10.624C89.3058 10.624 88.8685 10.736 88.4631 10.96C88.0685 11.184 87.7538 11.52 87.5191 11.968C87.2845 12.4053 87.1671 12.944 87.1671 13.584C87.1671 14.5333 87.4071 15.2693 87.8871 15.792C88.3778 16.304 88.9911 16.56 89.7271 16.56ZM103.927 18.112C103.18 18.112 102.508 17.984 101.911 17.728C101.313 17.4613 100.844 17.088 100.503 16.608C100.161 16.128 99.9905 15.568 99.9905 14.928H101.943C101.985 15.408 102.172 15.8027 102.503 16.112C102.844 16.4213 103.319 16.576 103.927 16.576C104.556 16.576 105.047 16.4267 105.399 16.128C105.751 15.8187 105.927 15.424 105.927 14.944C105.927 14.5707 105.815 14.2667 105.591 14.032C105.377 13.7973 105.105 13.616 104.775 13.488C104.455 13.36 104.007 13.2213 103.431 13.072C102.705 12.88 102.113 12.688 101.655 12.496C101.207 12.2933 100.823 11.984 100.503 11.568C100.183 11.152 100.023 10.5973 100.023 9.904C100.023 9.264 100.183 8.704 100.503 8.224C100.823 7.744 101.271 7.376 101.847 7.12C102.423 6.864 103.089 6.736 103.847 6.736C104.924 6.736 105.804 7.008 106.487 7.552C107.18 8.08533 107.564 8.82133 107.639 9.76H105.623C105.591 9.35467 105.399 9.008 105.047 8.72C104.695 8.432 104.231 8.288 103.655 8.288C103.132 8.288 102.705 8.42133 102.375 8.688C102.044 8.95467 101.879 9.33867 101.879 9.84C101.879 10.1813 101.98 10.464 102.183 10.688C102.396 10.9013 102.663 11.072 102.983 11.2C103.303 11.328 103.74 11.4667 104.295 11.616C105.031 11.8187 105.628 12.0213 106.087 12.224C106.556 12.4267 106.951 12.7413 107.271 13.168C107.601 13.584 107.767 14.144 107.767 14.848C107.767 15.4133 107.612 15.9467 107.303 16.448C107.004 16.9493 106.561 17.3547 105.975 17.664C105.399 17.9627 104.716 18.112 103.927 18.112ZM110.655 18.112C110.324 18.112 110.047 18 109.823 17.776C109.599 17.552 109.487 17.2747 109.487 16.944C109.487 16.6133 109.599 16.336 109.823 16.112C110.047 15.888 110.324 15.776 110.655 15.776C110.975 15.776 111.247 15.888 111.471 16.112C111.695 16.336 111.807 16.6133 111.807 16.944C111.807 17.2747 111.695 17.552 111.471 17.776C111.247 18 110.975 18.112 110.655 18.112ZM125.71 10.192C125.71 10.7573 125.577 11.2907 125.31 11.792C125.044 12.2933 124.617 12.704 124.03 13.024C123.444 13.3333 122.692 13.488 121.774 13.488H119.758V18H117.934V6.88H121.774C122.628 6.88 123.348 7.02933 123.934 7.328C124.532 7.616 124.974 8.01067 125.262 8.512C125.561 9.01333 125.71 9.57333 125.71 10.192ZM121.774 12C122.468 12 122.985 11.8453 123.326 11.536C123.668 11.216 123.838 10.768 123.838 10.192C123.838 8.976 123.15 8.368 121.774 8.368H119.758V12H121.774ZM135.53 13.376C135.53 13.7067 135.509 14.0053 135.466 14.272H128.73C128.783 14.976 129.045 15.5413 129.514 15.968C129.983 16.3947 130.559 16.608 131.242 16.608C132.223 16.608 132.917 16.1973 133.322 15.376H135.29C135.023 16.1867 134.538 16.8533 133.834 17.376C133.141 17.888 132.277 18.144 131.242 18.144C130.399 18.144 129.642 17.9573 128.97 17.584C128.309 17.2 127.786 16.6667 127.402 15.984C127.029 15.2907 126.842 14.4907 126.842 13.584C126.842 12.6773 127.023 11.8827 127.386 11.2C127.759 10.5067 128.277 9.97333 128.938 9.6C129.61 9.22667 130.378 9.04 131.242 9.04C132.074 9.04 132.815 9.22133 133.466 9.584C134.117 9.94667 134.623 10.4587 134.986 11.12C135.349 11.7707 135.53 12.5227 135.53 13.376ZM133.626 12.8C133.615 12.128 133.375 11.5893 132.906 11.184C132.437 10.7787 131.855 10.576 131.162 10.576C130.533 10.576 129.994 10.7787 129.546 11.184C129.098 11.5787 128.831 12.1173 128.746 12.8H133.626ZM136.717 13.552C136.717 12.6667 136.898 11.8827 137.261 11.2C137.634 10.5173 138.136 9.98933 138.765 9.616C139.405 9.232 140.114 9.04 140.893 9.04C141.469 9.04 142.034 9.168 142.589 9.424C143.154 9.66933 143.602 10 143.933 10.416V6.16H145.773V18H143.933V16.672C143.634 17.0987 143.218 17.4507 142.685 17.728C142.162 18.0053 141.56 18.144 140.877 18.144C140.109 18.144 139.405 17.952 138.765 17.568C138.136 17.1733 137.634 16.6293 137.261 15.936C136.898 15.232 136.717 14.4373 136.717 13.552ZM143.933 13.584C143.933 12.976 143.805 12.448 143.549 12C143.304 11.552 142.978 11.2107 142.573 10.976C142.168 10.7413 141.73 10.624 141.261 10.624C140.792 10.624 140.354 10.7413 139.949 10.976C139.544 11.2 139.213 11.536 138.957 11.984C138.712 12.4213 138.589 12.944 138.589 13.552C138.589 14.16 138.712 14.6933 138.957 15.152C139.213 15.6107 139.544 15.9627 139.949 16.208C140.365 16.4427 140.802 16.56 141.261 16.56C141.73 16.56 142.168 16.4427 142.573 16.208C142.978 15.9733 143.304 15.632 143.549 15.184C143.805 14.7253 143.933 14.192 143.933 13.584ZM149.993 10.464C150.259 10.016 150.611 9.66933 151.049 9.424C151.497 9.168 152.025 9.04 152.633 9.04V10.928H152.169C151.454 10.928 150.91 11.1093 150.537 11.472C150.174 11.8347 149.993 12.464 149.993 13.36V18H148.169V9.184H149.993V10.464ZM158.133 18.144C157.301 18.144 156.549 17.9573 155.877 17.584C155.205 17.2 154.677 16.6667 154.293 15.984C153.909 15.2907 153.717 14.4907 153.717 13.584C153.717 12.688 153.915 11.8933 154.309 11.2C154.704 10.5067 155.243 9.97333 155.925 9.6C156.608 9.22667 157.371 9.04 158.213 9.04C159.056 9.04 159.819 9.22667 160.501 9.6C161.184 9.97333 161.723 10.5067 162.117 11.2C162.512 11.8933 162.709 12.688 162.709 13.584C162.709 14.48 162.507 15.2747 162.101 15.968C161.696 16.6613 161.141 17.2 160.437 17.584C159.744 17.9573 158.976 18.144 158.133 18.144ZM158.133 16.56C158.603 16.56 159.04 16.448 159.445 16.224C159.861 16 160.197 15.664 160.453 15.216C160.709 14.768 160.837 14.224 160.837 13.584C160.837 12.944 160.715 12.4053 160.469 11.968C160.224 11.52 159.899 11.184 159.493 10.96C159.088 10.736 158.651 10.624 158.181 10.624C157.712 10.624 157.275 10.736 156.869 10.96C156.475 11.184 156.16 11.52 155.925 11.968C155.691 12.4053 155.573 12.944 155.573 13.584C155.573 14.5333 155.813 15.2693 156.293 15.792C156.784 16.304 157.397 16.56 158.133 16.56ZM177.805 18H175.981L170.493 9.696V18H168.669V6.864H170.493L175.981 15.152V6.864H177.805V18ZM184.024 18.144C183.192 18.144 182.44 17.9573 181.768 17.584C181.096 17.2 180.568 16.6667 180.184 15.984C179.8 15.2907 179.608 14.4907 179.608 13.584C179.608 12.688 179.805 11.8933 180.2 11.2C180.595 10.5067 181.133 9.97333 181.816 9.6C182.499 9.22667 183.261 9.04 184.104 9.04C184.947 9.04 185.709 9.22667 186.392 9.6C187.075 9.97333 187.613 10.5067 188.008 11.2C188.403 11.8933 188.6 12.688 188.6 13.584C188.6 14.48 188.397 15.2747 187.992 15.968C187.587 16.6613 187.032 17.2 186.328 17.584C185.635 17.9573 184.867 18.144 184.024 18.144ZM184.024 16.56C184.493 16.56 184.931 16.448 185.336 16.224C185.752 16 186.088 15.664 186.344 15.216C186.6 14.768 186.728 14.224 186.728 13.584C186.728 12.944 186.605 12.4053 186.36 11.968C186.115 11.52 185.789 11.184 185.384 10.96C184.979 10.736 184.541 10.624 184.072 10.624C183.603 10.624 183.165 10.736 182.76 10.96C182.365 11.184 182.051 11.52 181.816 11.968C181.581 12.4053 181.464 12.944 181.464 13.584C181.464 14.5333 181.704 15.2693 182.184 15.792C182.675 16.304 183.288 16.56 184.024 16.56ZM192.227 10.464C192.494 10.016 192.846 9.66933 193.283 9.424C193.731 9.168 194.259 9.04 194.867 9.04V10.928H194.403C193.688 10.928 193.144 11.1093 192.771 11.472C192.408 11.8347 192.227 12.464 192.227 13.36V18H190.403V9.184H192.227V10.464ZM198.672 10.672V15.552C198.672 15.8827 198.746 16.1227 198.896 16.272C199.056 16.4107 199.322 16.48 199.696 16.48H200.816V18H199.376C198.554 18 197.925 17.808 197.488 17.424C197.05 17.04 196.832 16.416 196.832 15.552V10.672H195.792V9.184H196.832V6.992H198.672V9.184H200.816V10.672H198.672ZM210.577 13.376C210.577 13.7067 210.556 14.0053 210.513 14.272H203.777C203.83 14.976 204.092 15.5413 204.561 15.968C205.03 16.3947 205.606 16.608 206.289 16.608C207.27 16.608 207.964 16.1973 208.369 15.376H210.337C210.07 16.1867 209.585 16.8533 208.881 17.376C208.188 17.888 207.324 18.144 206.289 18.144C205.446 18.144 204.689 17.9573 204.017 17.584C203.356 17.2 202.833 16.6667 202.449 15.984C202.076 15.2907 201.889 14.4907 201.889 13.584C201.889 12.6773 202.07 11.8827 202.433 11.2C202.806 10.5067 203.324 9.97333 203.985 9.6C204.657 9.22667 205.425 9.04 206.289 9.04C207.121 9.04 207.862 9.22133 208.513 9.584C209.164 9.94667 209.67 10.4587 210.033 11.12C210.396 11.7707 210.577 12.5227 210.577 13.376ZM208.673 12.8C208.662 12.128 208.422 11.5893 207.953 11.184C207.484 10.7787 206.902 10.576 206.209 10.576C205.58 10.576 205.041 10.7787 204.593 11.184C204.145 11.5787 203.878 12.1173 203.793 12.8H208.673Z");
+    			attr_dev(path1, "fill", "#004FFF");
+    			add_location(path1, file$b, 13, 2, 524);
+    			attr_dev(path2, "d", "M343.5 18L350.25 12.003L343.5 6");
+    			attr_dev(path2, "stroke", "#0C090D");
+    			attr_dev(path2, "stroke-width", "2");
+    			attr_dev(path2, "stroke-miterlimit", "10");
+    			attr_dev(path2, "stroke-linecap", "round");
+    			attr_dev(path2, "stroke-linejoin", "round");
+    			add_location(path2, file$b, 16, 2, 12912);
+    			attr_dev(svg, "width", "352");
+    			attr_dev(svg, "height", "24");
+    			attr_dev(svg, "viewBox", "0 0 352 24");
+    			attr_dev(svg, "fill", "none");
+    			attr_dev(svg, "xmlns", "http://www.w3.org/2000/svg");
+    			add_location(svg, file$b, 0, 0, 0);
+    		},
+    		l: function claim(nodes) {
+    			throw new Error("options.hydrate only works if the component was compiled with the `hydratable: true` option");
+    		},
+    		m: function mount(target, anchor) {
+    			insert_dev(target, svg, anchor);
+    			append_dev(svg, path0);
+    			append_dev(svg, path1);
+    			append_dev(svg, path2);
+    		},
+    		p: noop,
+    		i: noop,
+    		o: noop,
+    		d: function destroy(detaching) {
+    			if (detaching) detach_dev(svg);
+    		}
+    	};
+
+    	dispatch_dev("SvelteRegisterBlock", {
+    		block,
+    		id: create_fragment$b.name,
+    		type: "component",
+    		source: "",
+    		ctx
+    	});
+
+    	return block;
+    }
+
+    function instance$b($$self, $$props) {
+    	let { $$slots: slots = {}, $$scope } = $$props;
     	validate_slots("ArrowRight", slots, []);
     	const writable_props = [];
 
@@ -83579,20 +84823,20 @@ var app = (function () {
     class ArrowRight extends SvelteComponentDev {
     	constructor(options) {
     		super(options);
-    		init(this, options, instance$8, create_fragment$8, safe_not_equal, {});
+    		init(this, options, instance$b, create_fragment$b, safe_not_equal, {});
 
     		dispatch_dev("SvelteRegisterComponent", {
     			component: this,
     			tagName: "ArrowRight",
     			options,
-    			id: create_fragment$8.name
+    			id: create_fragment$b.name
     		});
     	}
     }
 
     /* src/components/Icon/index.svelte generated by Svelte v3.31.2 */
 
-    function create_fragment$9(ctx) {
+    function create_fragment$c(ctx) {
     	const block = {
     		c: noop,
     		l: function claim(nodes) {
@@ -83607,7 +84851,7 @@ var app = (function () {
 
     	dispatch_dev("SvelteRegisterBlock", {
     		block,
-    		id: create_fragment$9.name,
+    		id: create_fragment$c.name,
     		type: "component",
     		source: "",
     		ctx
@@ -83616,7 +84860,7 @@ var app = (function () {
     	return block;
     }
 
-    function instance$9($$self, $$props, $$invalidate) {
+    function instance$c($$self, $$props, $$invalidate) {
     	let { $$slots: slots = {}, $$scope } = $$props;
     	validate_slots("Icon", slots, []);
     	const writable_props = [];
@@ -83641,13 +84885,13 @@ var app = (function () {
     class Icon$1 extends SvelteComponentDev {
     	constructor(options) {
     		super(options);
-    		init(this, options, instance$9, create_fragment$9, safe_not_equal, {});
+    		init(this, options, instance$c, create_fragment$c, safe_not_equal, {});
 
     		dispatch_dev("SvelteRegisterComponent", {
     			component: this,
     			tagName: "Icon",
     			options,
-    			id: create_fragment$9.name
+    			id: create_fragment$c.name
     		});
     	}
     }
@@ -83666,8 +84910,8 @@ var app = (function () {
 
     /* src/components/Layout.svelte generated by Svelte v3.31.2 */
 
-    const { console: console_1$1 } = globals;
-    const file$9 = "src/components/Layout.svelte";
+    const { console: console_1$2 } = globals;
+    const file$c = "src/components/Layout.svelte";
     const get_header_slot_changes = dirty => ({});
     const get_header_slot_context = ctx => ({});
 
@@ -83721,7 +84965,7 @@ var app = (function () {
     	return block;
     }
 
-    function create_fragment$a(ctx) {
+    function create_fragment$d(ctx) {
     	let div;
     	let nav0;
     	let t0;
@@ -83787,23 +85031,23 @@ var app = (function () {
     			button4 = element("button");
     			button4.textContent = "Profile";
     			attr_dev(nav0, "class", "header svelte-145f2t4");
-    			add_location(nav0, file$9, 66, 2, 1031);
+    			add_location(nav0, file$c, 66, 2, 1031);
     			attr_dev(section, "class", "content svelte-145f2t4");
-    			add_location(section, file$9, 73, 2, 1144);
+    			add_location(section, file$c, 73, 2, 1144);
     			attr_dev(button0, "class", "svelte-145f2t4");
-    			add_location(button0, file$9, 78, 4, 1221);
+    			add_location(button0, file$c, 78, 4, 1221);
     			attr_dev(button1, "class", "svelte-145f2t4");
-    			add_location(button1, file$9, 79, 4, 1262);
+    			add_location(button1, file$c, 79, 4, 1262);
     			attr_dev(button2, "class", "svelte-145f2t4");
-    			add_location(button2, file$9, 80, 4, 1307);
+    			add_location(button2, file$c, 80, 4, 1307);
     			attr_dev(button3, "class", "svelte-145f2t4");
-    			add_location(button3, file$9, 82, 4, 1397);
+    			add_location(button3, file$c, 82, 4, 1397);
     			attr_dev(button4, "class", "svelte-145f2t4");
-    			add_location(button4, file$9, 83, 4, 1442);
+    			add_location(button4, file$c, 83, 4, 1442);
     			attr_dev(nav1, "class", "nav svelte-145f2t4");
-    			add_location(nav1, file$9, 77, 2, 1199);
+    			add_location(nav1, file$c, 77, 2, 1199);
     			attr_dev(div, "class", "root svelte-145f2t4");
-    			add_location(div, file$9, 65, 0, 1010);
+    			add_location(div, file$c, 65, 0, 1010);
     		},
     		l: function claim(nodes) {
     			throw new Error("options.hydrate only works if the component was compiled with the `hydratable: true` option");
@@ -83896,7 +85140,7 @@ var app = (function () {
 
     	dispatch_dev("SvelteRegisterBlock", {
     		block,
-    		id: create_fragment$a.name,
+    		id: create_fragment$d.name,
     		type: "component",
     		source: "",
     		ctx
@@ -83905,13 +85149,13 @@ var app = (function () {
     	return block;
     }
 
-    function instance$a($$self, $$props, $$invalidate) {
+    function instance$d($$self, $$props, $$invalidate) {
     	let { $$slots: slots = {}, $$scope } = $$props;
     	validate_slots("Layout", slots, ['header','default']);
     	const writable_props = [];
 
     	Object.keys($$props).forEach(key => {
-    		if (!~writable_props.indexOf(key) && key.slice(0, 2) !== "$$") console_1$1.warn(`<Layout> was created with unknown prop '${key}'`);
+    		if (!~writable_props.indexOf(key) && key.slice(0, 2) !== "$$") console_1$2.warn(`<Layout> was created with unknown prop '${key}'`);
     	});
 
     	const click_handler = () => console.log("start");
@@ -83927,29 +85171,21 @@ var app = (function () {
     class Layout extends SvelteComponentDev {
     	constructor(options) {
     		super(options);
-    		init(this, options, instance$a, create_fragment$a, safe_not_equal, {});
+    		init(this, options, instance$d, create_fragment$d, safe_not_equal, {});
 
     		dispatch_dev("SvelteRegisterComponent", {
     			component: this,
     			tagName: "Layout",
     			options,
-    			id: create_fragment$a.name
+    			id: create_fragment$d.name
     		});
     	}
     }
 
     /* src/App.svelte generated by Svelte v3.31.2 */
+    const file$d = "src/App.svelte";
 
-    const { Object: Object_1$1 } = globals;
-    const file$a = "src/App.svelte";
-
-    function get_each_context(ctx, list, i) {
-    	const child_ctx = ctx.slice();
-    	child_ctx[11] = list[i];
-    	return child_ctx;
-    }
-
-    // (87:4) {:else}
+    // (72:4) {:else}
     function create_else_block(ctx) {
     	let auth;
     	let current;
@@ -83982,71 +85218,47 @@ var app = (function () {
     		block,
     		id: create_else_block.name,
     		type: "else",
-    		source: "(87:4) {:else}",
+    		source: "(72:4) {:else}",
     		ctx
     	});
 
     	return block;
     }
 
-    // (71:4) {#if isSignedIn}
+    // (62:4) {#if isSignedIn}
     function create_if_block(ctx) {
-    	let div;
-    	let each_value = Object.keys(/*tracks*/ ctx[1]);
-    	validate_each_argument(each_value);
-    	let each_blocks = [];
+    	let feed;
+    	let current;
 
-    	for (let i = 0; i < each_value.length; i += 1) {
-    		each_blocks[i] = create_each_block(get_each_context(ctx, each_value, i));
-    	}
+    	feed = new Feed({
+    			props: { tracks: /*tracks*/ ctx[1] },
+    			$$inline: true
+    		});
 
     	const block = {
     		c: function create() {
-    			div = element("div");
-
-    			for (let i = 0; i < each_blocks.length; i += 1) {
-    				each_blocks[i].c();
-    			}
-
-    			add_location(div, file$a, 78, 6, 1610);
+    			create_component(feed.$$.fragment);
     		},
     		m: function mount(target, anchor) {
-    			insert_dev(target, div, anchor);
-
-    			for (let i = 0; i < each_blocks.length; i += 1) {
-    				each_blocks[i].m(div, null);
-    			}
+    			mount_component(feed, target, anchor);
+    			current = true;
     		},
     		p: function update(ctx, dirty) {
-    			if (dirty & /*showTrack, Object, tracks*/ 6) {
-    				each_value = Object.keys(/*tracks*/ ctx[1]);
-    				validate_each_argument(each_value);
-    				let i;
-
-    				for (i = 0; i < each_value.length; i += 1) {
-    					const child_ctx = get_each_context(ctx, each_value, i);
-
-    					if (each_blocks[i]) {
-    						each_blocks[i].p(child_ctx, dirty);
-    					} else {
-    						each_blocks[i] = create_each_block(child_ctx);
-    						each_blocks[i].c();
-    						each_blocks[i].m(div, null);
-    					}
-    				}
-
-    				for (; i < each_blocks.length; i += 1) {
-    					each_blocks[i].d(1);
-    				}
-
-    				each_blocks.length = each_value.length;
-    			}
+    			const feed_changes = {};
+    			if (dirty & /*tracks*/ 2) feed_changes.tracks = /*tracks*/ ctx[1];
+    			feed.$set(feed_changes);
     		},
-    		i: noop,
-    		o: noop,
+    		i: function intro(local) {
+    			if (current) return;
+    			transition_in(feed.$$.fragment, local);
+    			current = true;
+    		},
+    		o: function outro(local) {
+    			transition_out(feed.$$.fragment, local);
+    			current = false;
+    		},
     		d: function destroy(detaching) {
-    			if (detaching) detach_dev(div);
-    			destroy_each(each_blocks, detaching);
+    			destroy_component(feed, detaching);
     		}
     	};
 
@@ -84054,75 +85266,14 @@ var app = (function () {
     		block,
     		id: create_if_block.name,
     		type: "if",
-    		source: "(71:4) {#if isSignedIn}",
+    		source: "(62:4) {#if isSignedIn}",
     		ctx
     	});
 
     	return block;
     }
 
-    // (80:8) {#each Object.keys(tracks) as trackId}
-    function create_each_block(ctx) {
-    	let ul;
-    	let li;
-    	let a;
-    	let t0_value = /*trackId*/ ctx[11] + "";
-    	let t0;
-    	let t1;
-    	let mounted;
-    	let dispose;
-
-    	function click_handler() {
-    		return /*click_handler*/ ctx[3](/*trackId*/ ctx[11]);
-    	}
-
-    	const block = {
-    		c: function create() {
-    			ul = element("ul");
-    			li = element("li");
-    			a = element("a");
-    			t0 = text(t0_value);
-    			t1 = space();
-    			attr_dev(a, "class", "svelte-hj5uol");
-    			add_location(a, file$a, 81, 16, 1694);
-    			add_location(li, file$a, 81, 12, 1690);
-    			add_location(ul, file$a, 80, 10, 1673);
-    		},
-    		m: function mount(target, anchor) {
-    			insert_dev(target, ul, anchor);
-    			append_dev(ul, li);
-    			append_dev(li, a);
-    			append_dev(a, t0);
-    			append_dev(ul, t1);
-
-    			if (!mounted) {
-    				dispose = listen_dev(a, "click", click_handler, false, false, false);
-    				mounted = true;
-    			}
-    		},
-    		p: function update(new_ctx, dirty) {
-    			ctx = new_ctx;
-    			if (dirty & /*tracks*/ 2 && t0_value !== (t0_value = /*trackId*/ ctx[11] + "")) set_data_dev(t0, t0_value);
-    		},
-    		d: function destroy(detaching) {
-    			if (detaching) detach_dev(ul);
-    			mounted = false;
-    			dispose();
-    		}
-    	};
-
-    	dispatch_dev("SvelteRegisterBlock", {
-    		block,
-    		id: create_each_block.name,
-    		type: "each",
-    		source: "(80:8) {#each Object.keys(tracks) as trackId}",
-    		ctx
-    	});
-
-    	return block;
-    }
-
-    // (70:2) <Layout>
+    // (61:2) <Layout>
     function create_default_slot(ctx) {
     	let current_block_type_index;
     	let if_block;
@@ -84195,14 +85346,14 @@ var app = (function () {
     		block,
     		id: create_default_slot.name,
     		type: "slot",
-    		source: "(70:2) <Layout>",
+    		source: "(61:2) <Layout>",
     		ctx
     	});
 
     	return block;
     }
 
-    function create_fragment$b(ctx) {
+    function create_fragment$e(ctx) {
     	let main;
     	let layout;
     	let current;
@@ -84219,8 +85370,8 @@ var app = (function () {
     		c: function create() {
     			main = element("main");
     			create_component(layout.$$.fragment);
-    			attr_dev(main, "class", "svelte-hj5uol");
-    			add_location(main, file$a, 68, 0, 1368);
+    			attr_dev(main, "class", "svelte-bfcyz8");
+    			add_location(main, file$d, 59, 0, 1187);
     		},
     		l: function claim(nodes) {
     			throw new Error("options.hydrate only works if the component was compiled with the `hydratable: true` option");
@@ -84233,7 +85384,7 @@ var app = (function () {
     		p: function update(ctx, [dirty]) {
     			const layout_changes = {};
 
-    			if (dirty & /*$$scope, tracks, isSignedIn*/ 16387) {
+    			if (dirty & /*$$scope, tracks, isSignedIn*/ 131) {
     				layout_changes.$$scope = { dirty, ctx };
     			}
 
@@ -84256,7 +85407,7 @@ var app = (function () {
 
     	dispatch_dev("SvelteRegisterBlock", {
     		block,
-    		id: create_fragment$b.name,
+    		id: create_fragment$e.name,
     		type: "component",
     		source: "",
     		ctx
@@ -84265,7 +85416,7 @@ var app = (function () {
     	return block;
     }
 
-    function instance$b($$self, $$props, $$invalidate) {
+    function instance$e($$self, $$props, $$invalidate) {
     	let { $$slots: slots = {}, $$scope } = $$props;
     	validate_slots("App", slots, []);
     	let recording = false;
@@ -84275,9 +85426,6 @@ var app = (function () {
     	subscribe(value => $$invalidate(0, isSignedIn = !!value));
     	let tracks = {};
     	const onTracks = value => $$invalidate(1, tracks = value);
-    	let selected = null;
-    	const selectedStore = writable(selected);
-    	selectedStore.subscribe(value => selected = value);
 
     	const start = () => {
     		const id = newTrack();
@@ -84286,7 +85434,6 @@ var app = (function () {
     	};
 
     	const stop = () => store.set(null);
-    	const showTrack = trackId => selectedStore.set(tracks[trackId]);
 
     	onMount(() => {
     		initialize();
@@ -84295,16 +85442,15 @@ var app = (function () {
 
     	const writable_props = [];
 
-    	Object_1$1.keys($$props).forEach(key => {
+    	Object.keys($$props).forEach(key => {
     		if (!~writable_props.indexOf(key) && key.slice(0, 2) !== "$$") console.warn(`<App> was created with unknown prop '${key}'`);
     	});
-
-    	const click_handler = trackId => showTrack(trackId);
 
     	$$self.$capture_state = () => ({
     		onMount,
     		writable,
     		Map: Map_1,
+    		Feed,
     		Auth,
     		Layout,
     		initialize,
@@ -84317,37 +85463,33 @@ var app = (function () {
     		isSignedIn,
     		tracks,
     		onTracks,
-    		selected,
-    		selectedStore,
     		start,
-    		stop,
-    		showTrack
+    		stop
     	});
 
     	$$self.$inject_state = $$props => {
     		if ("recording" in $$props) recording = $$props.recording;
     		if ("isSignedIn" in $$props) $$invalidate(0, isSignedIn = $$props.isSignedIn);
     		if ("tracks" in $$props) $$invalidate(1, tracks = $$props.tracks);
-    		if ("selected" in $$props) selected = $$props.selected;
     	};
 
     	if ($$props && "$$inject" in $$props) {
     		$$self.$inject_state($$props.$$inject);
     	}
 
-    	return [isSignedIn, tracks, showTrack, click_handler];
+    	return [isSignedIn, tracks];
     }
 
     class App extends SvelteComponentDev {
     	constructor(options) {
     		super(options);
-    		init(this, options, instance$b, create_fragment$b, safe_not_equal, {});
+    		init(this, options, instance$e, create_fragment$e, safe_not_equal, {});
 
     		dispatch_dev("SvelteRegisterComponent", {
     			component: this,
     			tagName: "App",
     			options,
-    			id: create_fragment$b.name
+    			id: create_fragment$e.name
     		});
     	}
     }
