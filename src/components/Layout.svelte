@@ -22,45 +22,28 @@
     flex-direction: column;
     flex: 1;
   }
-
-  .nav {
-    display: flex;
-    align-items: center;
-    justify-content: space-between;
-    padding: 16px 32px;
-    background: #f5fafe;
-    box-shadow: 0px 0px 7px rgba(0, 0, 0, 0.15);
-  }
-
-  .nav button {
-    display: flex;
-    flex-direction: column-reverse;
-    justify-content: center;
-    align-items: center;
-    cursor: pointer;
-  }
-
-  :global(.nav svg) {
-    max-height: 32px;
-    margin-bottom: 8px;
-  }
-
-  ul {
-    margin: 0;
-    padding: 0;
-    list-style: none;
-  }
-
-  button {
-    margin: 0;
-    padding: 0;
-    border: none;
-    background: none;
-  }
 </style>
 
 <script>
+  import { writable } from 'svelte/store';
+
   import * as Icons from './Icon/index.svelte';
+  import Navbar from './Navbar/index.svelte';
+
+  const ROUTES = [
+    { name: 'Home', component: null, icon: Icons.Home },
+    { name: 'Search', component: null, icon: Icons.Search },
+    { name: 'Start', component: null, icon: Icons.Start },
+    { name: 'Routes', component: null, icon: Icons.Tracks },
+    { name: 'Profile', component: null, icon: null },
+  ];
+
+  let active = ROUTES[0].name;
+  const activeRouteStore = writable(active);
+  activeRouteStore.subscribe((value) => (active = value));
+
+  const navigateTo = (routeName) => () => activeRouteStore.set(routeName);
+  $: console.log(active);
 </script>
 
 <div class="root">
@@ -75,12 +58,5 @@
     <slot />
   </section>
 
-  <nav class="nav">
-    <button>Home <Icons.Home /></button>
-    <button>Search <Icons.Search /></button>
-    <button on:click="{() => console.log('start')}"
-      >Start <Icons.Start /></button>
-    <button>Routes <Icons.Tracks /></button>
-    <button>Profile</button>
-  </nav>
+  <Navbar routes="{ROUTES}" active="{active}" navigateTo="{navigateTo}" />
 </div>
